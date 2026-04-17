@@ -1,0 +1,2558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pricelist Manager AI</title>
+  
+  <!-- Tailwind CSS for styling -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- FontAwesome for Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- React & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  
+  <!-- Babel to compile JSX inside the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- localForage for unlimited IndexedDB storage (bypasses 5MB limit) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
+
+  <!-- SheetJS for Excel Import/Export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <style>
+    /* Printing Overrides - Luxury & Formal Edition */
+    @media print {
+      @page { margin: 12mm 8mm; size: auto; }
+      html { font-size: 72% !important; }
+      
+      body { background-color: white !important; color: #0f172a !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; min-height: auto !important; }
+      .print\:hidden { display: none !important; }
+      .print\:flex { display: flex !important; }
+      .print\:block { display: block !important; }
+      
+      main { display: block !important; margin: 0 !important; padding: 0 !important; max-width: none !important; grid-template-columns: 1fr !important; gap: 0 !important; }
+      section { border: none !important; box-shadow: none !important; padding: 0 !important; min-height: auto !important; }
+      
+      .overflow-x-auto { overflow: visible !important; }
+      table { width: 100% !important; border-collapse: collapse !important; page-break-inside: auto; border: 2px solid #0f172a !important; }
+      tr { page-break-inside: avoid; page-break-after: auto; }
+      
+      /* Refined cell borders */
+      th, td { 
+        border: 1px solid #cbd5e1 !important; 
+        padding: 5px 6px !important;
+        line-height: 1.2 !important;
+      }
+      
+      /* Solid black line under header */
+      thead th { border-bottom: 2px solid #0f172a !important; }
+      
+      td img { 
+        width: 64px !important; 
+        height: 64px !important; 
+        min-height: 64px !important;
+        object-fit: contain !important;
+      }
+
+      .mb-8 { margin-bottom: 1rem !important; }
+      .mb-6 { margin-bottom: 0.75rem !important; }
+      .p-6 { padding: 0.75rem !important; }
+      .mt-16 { margin-top: 1rem !important; }
+      .pt-8 { padding-top: 0.5rem !important; }
+
+      .page-break-inside-avoid { page-break-inside: avoid !important; }
+    }
+  </style>
+</head>
+<body>
+  
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+    // --- HELPER FUNCTIONS ---
+    const getLocalISODate = (date = new Date()) => {
+        const offset = date.getTimezoneOffset() * 60000;
+        return new Date(date.getTime() - offset).toISOString().split('T')[0];
+    };
+
+    const deepMergePermissions = (defaultPerms, loadedPerms) => {
+        if (!loadedPerms) return { ...defaultPerms };
+        const merged = { ...defaultPerms };
+        for (const key in defaultPerms) {
+            if (typeof defaultPerms[key] === 'object' && defaultPerms[key] !== null) {
+                merged[key] = { ...defaultPerms[key], ...(loadedPerms[key] || {}) };
+            } else {
+                merged[key] = loadedPerms[key] !== undefined ? loadedPerms[key] : defaultPerms[key];
+            }
+        }
+        return merged;
+    };
+
+    const flattenObj = (ob, prefix = '') => {
+        let result = {};
+        for (const i in ob) {
+            if (!Object.prototype.hasOwnProperty.call(ob, i)) continue;
+            const key = prefix ? `${prefix}.${i}` : i;
+            if (typeof ob[i] === 'object' && ob[i] !== null && !Array.isArray(ob[i])) {
+                if (i === 'permissions') {
+                    result[key] = ob[i]; // Keep deep complex objects intact to prevent huge tables
+                } else {
+                    Object.assign(result, flattenObj(ob[i], key));
+                }
+            } else {
+                result[key] = ob[i];
+            }
+        }
+        return result;
+    };
+
+    const unflattenObj = (flatOb) => {
+        let result = {};
+        for (const i in flatOb) {
+            let keys = i.split('.');
+            let current = result;
+            for (let j = 0; j < keys.length; j++) {
+                let key = keys[j];
+                if (j === keys.length - 1) {
+                    current[key] = flatOb[i];
+                } else {
+                    if (!current[key]) current[key] = {};
+                    current = current[key];
+                }
+            }
+        }
+        return result;
+    };
+
+    // --- INITIAL PERMISSIONS DATA (Granular) ---
+    const rolePermissions = {
+      admin: {
+        products: { view: true, add: true, edit: true, remove: true },
+        users: { view: true, add: true, edit: true, remove: true },
+        company: { view: true, add: true, edit: true, remove: true },
+        discounts: { view: true, add: true, edit: true, remove: true },
+        masterData: { view: true, add: true, edit: true, remove: true },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: true }
+      },
+      manager: {
+        products: { view: true, add: true, edit: true, remove: true },
+        users: { view: true, add: true, edit: true, remove: true },
+        company: { view: false, add: false, edit: false, remove: false },
+        discounts: { view: true, add: true, edit: true, remove: true },
+        masterData: { view: true, add: true, edit: true, remove: false },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: false }
+      },
+      regional: {
+        products: { view: true, add: false, edit: false, remove: false },
+        users: { view: true, add: true, edit: true, remove: false },
+        company: { view: true, add: false, edit: false, remove: false },
+        discounts: { view: true, add: false, edit: false, remove: false },
+        masterData: { view: true, add: false, edit: false, remove: false },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: false }
+      },
+      supervisor: {
+        products: { view: true, add: false, edit: false, remove: false },
+        users: { view: true, add: true, edit: true, remove: false },
+        company: { view: true, add: false, edit: false, remove: false },
+        discounts: { view: true, add: true, edit: true, remove: false },
+        masterData: { view: true, add: false, edit: false, remove: false },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: false }
+      },
+      backOffice: {
+        products: { view: true, add: true, edit: true, remove: true },
+        users: { view: false, add: false, edit: false, remove: false },
+        company: { view: true, add: true, edit: true, remove: true },
+        discounts: { view: true, add: true, edit: true, remove: true },
+        masterData: { view: true, add: true, edit: true, remove: false },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: true }
+      },
+      salesAdmin: {
+        products: { view: true, add: true, edit: true, remove: false },
+        users: { view: true, add: true, edit: true, remove: false },
+        company: { view: true, add: false, edit: false, remove: false },
+        discounts: { view: true, add: true, edit: true, remove: false },
+        masterData: { view: true, add: true, edit: true, remove: false },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: true }
+      },
+      salesperson: {
+        products: { view: true, add: false, edit: false, remove: false },
+        users: { view: false, add: false, edit: false, remove: false },
+        company: { view: false, add: false, edit: false, remove: false },
+        discounts: { view: true, add: false, edit: false, remove: false },
+        masterData: { view: false, add: false, edit: false, remove: false },
+        tabs: { lpPricelist: true, simplePricelist: true },
+        actions: { canSave: true, canPrint: true, canImportExport: false }
+      }
+    };
+
+    const defaultAdmin = {
+      id: 'admin_1', name: 'System Admin', phone: '080-000-0000',
+      email: 'admin', password: '778899', role: 'admin',
+      permissions: { ...rolePermissions.admin }, forcePasswordChange: false, sessionToken: null
+    };
+
+    const defaultManager = {
+      id: 'manager_1', name: 'System Manager', phone: '080-000-0001',
+      email: 'manager', password: '778899', role: 'manager',
+      permissions: { ...rolePermissions.manager }, forcePasswordChange: false, sessionToken: null
+    };
+
+    const defaultSalesperson = {
+      id: 'user_1', name: 'System User', phone: '080-000-0002',
+      email: 'admin@mycnpgroup.com', password: '778899', role: 'salesperson',
+      permissions: { ...rolePermissions.salesperson }, forcePasswordChange: false, sessionToken: null
+    };
+
+    const initialProductCategories = [
+      { id: 'pc1', name: 'รางน้ำฝน (Gutters)' },
+      { id: 'pc2', name: 'หลังคาและตะแกรง (Roofs & Mesh)' }
+    ];
+
+    const initialCategories = [
+      { id: 'c1', name: 'Primo', discount: 12 },
+      { id: 'c2', name: 'Primo Pipe', discount: 10 },
+      { id: 'c3', name: 'Primo Adjuster', discount: 10 },
+      { id: 'c4', name: 'Primo Mesh', discount: 10 },
+    ];
+
+    const initialProducts = [
+      {
+        id: 1, name: 'รางน้ำฝน วีจี พรีโม่', categoryId: 'c1', productCategoryId: 'pc1',
+        image: 'https://placehold.co/200x200/f8fafc/94a3b8?text=Gutter',
+        packQty: '6', unit: 'เส้น / มัด',
+        prices: {
+          v1: { dealerBox: 517, dealerUnbox: 530, sellingPrice: 580, retail: 620 },
+          v2: { dealerBox: 550, dealerUnbox: 565, sellingPrice: 600, retail: 660 },
+          v3: { dealerBox: 550, dealerUnbox: 565, sellingPrice: 600, retail: 660 },
+          v4: { dealerBox: 550, dealerUnbox: 565, sellingPrice: 600, retail: 660 }
+        }
+      },
+      {
+        id: 2, name: 'ตะแกรงอลูมิเนียม', categoryId: 'c4', productCategoryId: 'pc2',
+        image: 'https://placehold.co/200x200/f8fafc/94a3b8?text=Mesh',
+        packQty: '40', unit: 'ชิ้น / ลัง',
+        prices: {
+          v1: { dealerBox: 122, dealerUnbox: 130, sellingPrice: 132, retail: 135 },
+          v2: { dealerBox: 122, dealerUnbox: 130, sellingPrice: 132, retail: 135 },
+          v3: { dealerBox: 122, dealerUnbox: 130, sellingPrice: 132, retail: 135 },
+          v4: { dealerBox: 122, dealerUnbox: 130, sellingPrice: 132, retail: 135 }
+        }
+      }
+    ];
+
+    function App() {
+      // --- APP CORE STATES ---
+      const [isInitializing, setIsInitializing] = useState(true);
+      const [currentUser, setCurrentUser] = useState(null);
+
+      // --- LOGIN STATES ---
+      const [loginForm, setLoginForm] = useState({ loginId: '', password: '' });
+      const [showReset, setShowReset] = useState(false);
+      const [resetEmail, setResetEmail] = useState('');
+      const [newPasswordForm, setNewPasswordForm] = useState({ newPassword: '', confirmPassword: '' });
+      const [isLoggingIn, setIsLoggingIn] = useState(false);
+
+      // --- APP DATA STATES ---
+      const [activeTab, setActiveTab] = useState('lpPricelist');
+      const [isSaving, setIsSaving] = useState(false);
+      
+      const [categories, setCategories] = useState(initialCategories);
+      const [products, setProducts] = useState(initialProducts);
+      const [headers, setHeaders] = useState({ v1: 'White (ขาว)', v2: 'Brown (น้ำตาล)', v3: 'Grey (เทา)', v4: 'Black (ดำ)' });
+      
+      const [productCategories, setProductCategories] = useState(initialProductCategories);
+      const [selectedProductCategories, setSelectedProductCategories] = useState(['all']);
+      const [isFilterDropdownOpen, setIsFilterDropdownOpen] = useState(false);
+
+      const [company, setCompany] = useState({
+        id: 'default_comp',
+        name: 'บริษัท วี อาร์ จี มาร์เก็ตติ้ง จำกัด',
+        address: 'เลขประจำตัวผู้เสียภาษี: 010 555 403 8564 (สำนักงานใหญ่)\nที่อยู่: 33/2 ม. 18 ตำบลศาลาแดง อำเภอบางน้ำเปรี้ยว จังหวัดฉะเชิงเทรา 24000',
+        contact: 'โทร: 038-592-629, 087-654-7788',
+        logo: 'https://placehold.co/150x150/1e3a8a/ffffff?text=LOGO'
+      });
+
+      const [salesperson, setSalesperson] = useState('');
+      const [salespersonPhone, setSalespersonPhone] = useState('');
+      
+      const [isModalOpen, setIsModalOpen] = useState(false);
+      const [productToDelete, setProductToDelete] = useState(null);
+      
+      // --- DATABASE STATES ---
+      const [savedCompanies, setSavedCompanies] = useState([company]);
+      const [savedSalespersons, setSavedSalespersons] = useState([defaultAdmin, defaultManager, defaultSalesperson]); 
+      
+      const [loginLogs, setLoginLogs] = useState([]);
+      const [activityLogs, setActivityLogs] = useState([]);
+
+      // Database Form States
+      const [compForm, setCompForm] = useState({ id: '', name: '', address: '', contact: '', logo: '' });
+      const [isEditingComp, setIsEditingComp] = useState(false);
+      
+      const [spForm, setSpForm] = useState({ id: '', name: '', phone: '', email: '', password: '', role: 'salesperson', permissions: {...rolePermissions.salesperson} });
+      const [isEditingSp, setIsEditingSp] = useState(false);
+
+      const [pcForm, setPcForm] = useState({ id: '', name: '' });
+      const [isEditingPc, setIsEditingPc] = useState(false);
+
+      // Logs Export States
+      const [exportLogType, setExportLogType] = useState('login');
+      const [exportStartDate, setExportStartDate] = useState(getLocalISODate(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)));
+      const [exportEndDate, setExportEndDate] = useState(getLocalISODate());
+
+      // Conflict Resolution Wizard State
+      const [mergeWizard, setMergeWizard] = useState({ isOpen: false, type: '', queue: [], currentIndex: 0, newItems: [], resolvedItems: [], extraUpdates: {} });
+      const [wizardDraftFlat, setWizardDraftFlat] = useState({});
+      const [wizardExistingFlat, setWizardExistingFlat] = useState({});
+      const [wizardImportedFlat, setWizardImportedFlat] = useState({});
+
+      const [newProduct, setNewProduct] = useState({
+        name: '', categoryId: '', productCategoryId: '', image: '', packQty: '', unit: '',
+        v1DealerBox: '', v1DealerUnbox: '', v1SellingPrice: '', v1Retail: '', 
+        v2DealerBox: '', v2DealerUnbox: '', v2SellingPrice: '', v2Retail: '', 
+        v3DealerBox: '', v3DealerUnbox: '', v3SellingPrice: '', v3Retail: '', 
+        v4DealerBox: '', v4DealerUnbox: '', v4SellingPrice: '', v4Retail: ''
+      });
+
+      const [importedFileName, setImportedFileName] = useState(null);
+
+      // Sub-tab state for Database Management
+      const [dbTab, setDbTab] = useState('entities');
+
+      // ==========================================
+      // UTILITY FUNCTIONS & LOGGING
+      // ==========================================
+      const logActivity = useCallback((action, details) => {
+          setActivityLogs(prev => {
+             const newLog = {
+                id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
+                timestamp: Date.now(),
+                userId: currentUser ? currentUser.id : 'system',
+                userName: currentUser ? currentUser.name : 'System',
+                action,
+                details
+             };
+             return [newLog, ...prev];
+          });
+      }, [currentUser]);
+
+      const _forceSaveToDB = async (overrideData) => {
+          try {
+              const dataToSave = { categories, products, headers, company, salesperson, salespersonPhone, savedCompanies, savedSalespersons, loginLogs, activityLogs, productCategories, ...overrideData };
+              if (typeof window !== 'undefined' && window.localforage) {
+                  await window.localforage.setItem('vg_pricelist_data', dataToSave);
+              } else {
+                  localStorage.setItem('vg_pricelist_data', JSON.stringify(dataToSave));
+              }
+          } catch (err) {
+              console.error("Critical error saving to DB", err);
+          }
+      };
+
+      const categoryDiscountMap = useMemo(() => {
+          const map = new Map();
+          categories.forEach(c => map.set(c.id, c.discount));
+          return map;
+      }, [categories]);
+
+      const getDiscountedPrice = useCallback((basePrice, categoryId) => {
+        const discount = categoryDiscountMap.get(categoryId) || 0;
+        const discountedPrice = basePrice * (1 - (discount / 100));
+        return (Math.ceil(discountedPrice * 100) / 100).toFixed(2);
+      }, [categoryDiscountMap]);
+
+      // ==========================================
+      // EFFECTS (INITIALIZATION & SESSION)
+      // ==========================================
+      useEffect(() => {
+        const loadSavedData = async () => {
+          try {
+            let data = null;
+            if (typeof window !== 'undefined' && window.localforage) {
+               data = await window.localforage.getItem('vg_pricelist_data');
+            }
+            if (!data) {
+              const oldData = localStorage.getItem('vg_pricelist_data');
+              if (oldData) data = JSON.parse(oldData);
+            }
+
+            if (data) {
+              if (data.categories) setCategories(data.categories);
+              if (data.products) setProducts(data.products);
+              if (data.headers) setHeaders(data.headers);
+              if (data.company) setCompany(data.company);
+              if (data.savedCompanies) setSavedCompanies(data.savedCompanies);
+              if (data.productCategories) setProductCategories(data.productCategories);
+              
+              const now = Date.now();
+              const SIX_MONTHS_MS = 180 * 24 * 60 * 60 * 1000;
+              const validLoginLogs = (data.loginLogs || []).filter(log => (now - log.timestamp) <= SIX_MONTHS_MS);
+              setLoginLogs(validLoginLogs);
+
+              const TWELVE_MONTHS_MS = 365 * 24 * 60 * 60 * 1000;
+              const validActivityLogs = (data.activityLogs || []).filter(log => (now - log.timestamp) <= TWELVE_MONTHS_MS);
+              setActivityLogs(validActivityLogs);
+
+              let loadedUsers = data.savedSalespersons || [];
+              loadedUsers = loadedUsers.map(u => {
+                 let rRole = u.role === 'user' ? 'salesperson' : (u.role || 'salesperson'); 
+                 let perms = u.permissions || { ...rolePermissions[rRole] };
+                 
+                 perms = deepMergePermissions(rolePermissions[rRole], perms);
+                 
+                 return {
+                   ...u,
+                   email: u.email || `${u.name.replace(/\s+/g, '').toLowerCase()}@company.com`,
+                   password: u.password || 'password123',
+                   role: rRole,
+                   permissions: perms,
+                   forcePasswordChange: u.forcePasswordChange || false,
+                   sessionToken: u.sessionToken || null
+                 }
+              });
+              
+              if (!loadedUsers.find(u => u.email === 'admin')) loadedUsers.push(defaultAdmin);
+              if (!loadedUsers.find(u => u.email === 'manager')) loadedUsers.push(defaultManager);
+              if (!loadedUsers.find(u => u.email === 'admin@mycnpgroup.com')) loadedUsers.push(defaultSalesperson);
+
+              setSavedSalespersons(loadedUsers);
+
+              // --- SECURE SESSION CHECK ---
+              const storedSessionToken = localStorage.getItem('vg_active_session_token');
+              const loginTimestamp = localStorage.getItem('vg_login_timestamp');
+              
+              if (storedSessionToken && loginTimestamp) {
+                  const timeElapsed = Date.now() - parseInt(loginTimestamp, 10);
+                  const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+                  
+                  if (timeElapsed > TWELVE_HOURS) {
+                      localStorage.removeItem('vg_active_session_token');
+                      localStorage.removeItem('vg_login_timestamp');
+                  } else {
+                      const activeUser = loadedUsers.find(u => u.sessionToken === storedSessionToken);
+                      if (activeUser) setCurrentUser(activeUser);
+                  }
+              } else if (storedSessionToken && !loginTimestamp) {
+                  localStorage.removeItem('vg_active_session_token');
+              }
+            }
+          } catch (e) {
+            console.error("Error loading saved data", e);
+          } finally {
+            setIsInitializing(false);
+          }
+        };
+        loadSavedData();
+      }, []);
+
+      useEffect(() => {
+          if (currentUser) {
+              setSalesperson(currentUser.name);
+              setSalespersonPhone(currentUser.phone);
+              
+              if (!currentUser.permissions.tabs.lpPricelist && activeTab === 'lpPricelist') {
+                  if(currentUser.permissions.tabs.simplePricelist) setActiveTab('simplePricelist');
+                  else setActiveTab('databases');
+              }
+              if (!currentUser.permissions.tabs.simplePricelist && activeTab === 'simplePricelist') {
+                  setActiveTab('databases');
+              }
+          }
+      }, [currentUser]);
+
+      useEffect(() => {
+          if (activeTab === 'databases' && currentUser) {
+              const hasAccess = 
+                  (dbTab === 'entities' && currentUser.permissions.company.view) ||
+                  (dbTab === 'users' && currentUser.permissions.users.view) ||
+                  (dbTab === 'config' && currentUser.permissions.masterData.view) ||
+                  (dbTab === 'data' && currentUser.permissions.actions.canImportExport) ||
+                  (dbTab === 'logs' && currentUser.role === 'admin');
+              
+              if (!hasAccess) {
+                  if (currentUser.permissions.company.view) setDbTab('entities');
+                  else if (currentUser.permissions.users.view) setDbTab('users');
+                  else if (currentUser.permissions.actions.canImportExport) setDbTab('data');
+                  else if (currentUser.permissions.masterData.view) setDbTab('config');
+                  else if (currentUser.role === 'admin') setDbTab('logs');
+              }
+          }
+      }, [activeTab, currentUser, dbTab]);
+
+      // --- SESSION MONITORING (12 HOURS) ---
+      const handleLogoutRef = useRef(null);
+
+      useEffect(() => {
+          handleLogoutRef.current = handleLogout;
+      });
+
+      useEffect(() => {
+          let interval;
+          if (currentUser) {
+              interval = setInterval(() => {
+                  const loginTimestamp = localStorage.getItem('vg_login_timestamp');
+                  if (loginTimestamp) {
+                      const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+                      if (Date.now() - parseInt(loginTimestamp, 10) > TWELVE_HOURS) {
+                          alert("Your session has expired (12 hours limit). Please log in again.");
+                          if (handleLogoutRef.current) handleLogoutRef.current();
+                      }
+                  }
+              }, 60000);
+          }
+          return () => clearInterval(interval);
+      }, [currentUser]);
+
+      // When wizard opens or index changes, setup flattened states
+      useEffect(() => {
+          if (mergeWizard.isOpen && mergeWizard.queue[mergeWizard.currentIndex]) {
+              const current = mergeWizard.queue[mergeWizard.currentIndex];
+              setWizardExistingFlat(flattenObj(current.existing));
+              setWizardImportedFlat(flattenObj(current.imported));
+              setWizardDraftFlat(flattenObj(current.draft));
+          }
+      }, [mergeWizard.isOpen, mergeWizard.currentIndex, mergeWizard.queue]);
+
+      const handleWizardDraftChange = (key, val, originalType) => {
+          let parsedVal = val;
+          if (originalType === 'number' && val !== '') {
+              parsedVal = Number(val);
+          }
+          setWizardDraftFlat(prev => ({ ...prev, [key]: parsedVal }));
+      };
+
+      // ==========================================
+      // AUTHENTICATION HANDLERS
+      // ==========================================
+      const completeLogin = (user, lat, lng) => {
+          const newSessionToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
+          
+          const newLog = {
+              id: Date.now().toString(),
+              userId: user.id,
+              userName: user.name,
+              role: user.role,
+              timestamp: Date.now(),
+              lat,
+              lng
+          };
+
+          const updatedUser = { ...user, sessionToken: newSessionToken };
+          const updatedUsers = savedSalespersons.map(u => u.id === user.id ? updatedUser : u);
+          const updatedLogs = [newLog, ...loginLogs];
+
+          setSavedSalespersons(updatedUsers);
+          setLoginLogs(updatedLogs);
+          setCurrentUser(updatedUser);
+          
+          localStorage.setItem('vg_active_session_token', newSessionToken);
+          localStorage.setItem('vg_login_timestamp', Date.now().toString());
+          
+          setLoginForm({ loginId: '', password: '' });
+          setIsLoggingIn(false);
+          
+          if(updatedUser.permissions.tabs.lpPricelist) setActiveTab('lpPricelist');
+          else if (updatedUser.permissions.tabs.simplePricelist) setActiveTab('simplePricelist');
+          else setActiveTab('databases');
+
+          _forceSaveToDB({ savedSalespersons: updatedUsers, loginLogs: updatedLogs });
+      };
+
+      const handleLogin = (e) => {
+          e.preventDefault();
+          const user = savedSalespersons.find(u => u.email.toLowerCase() === loginForm.loginId.toLowerCase() && u.password === loginForm.password);
+          
+          if (!user) {
+              setIsLoggingIn(false);
+              return alert("Invalid email or password.");
+          }
+
+          setIsLoggingIn(true);
+
+          if (user.role === 'admin') {
+              completeLogin(user, null, null);
+              return;
+          }
+
+          if (!navigator.geolocation) {
+              setIsLoggingIn(false);
+              return alert("Geolocation is not supported by your browser. Location access is strictly required to login.");
+          }
+
+          navigator.geolocation.getCurrentPosition(
+              (position) => {
+                  completeLogin(user, position.coords.latitude, position.coords.longitude);
+              },
+              (error) => {
+                  setIsLoggingIn(false);
+                  alert("Location access is strictly required to log in. Please allow location access in your browser settings and try again.");
+              },
+              { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+          );
+      };
+
+      const handleLogout = () => {
+          if (currentUser) {
+              const updatedUser = { ...currentUser, sessionToken: null };
+              const updatedUsers = savedSalespersons.map(u => u.id === currentUser.id ? updatedUser : u);
+              setSavedSalespersons(updatedUsers);
+              _forceSaveToDB({ savedSalespersons: updatedUsers });
+          }
+          setCurrentUser(null);
+          setSalesperson('');
+          setSalespersonPhone('');
+          localStorage.removeItem('vg_active_session_token');
+          localStorage.removeItem('vg_login_timestamp');
+          setActiveTab('lpPricelist');
+      };
+
+      const handleForgotPassword = (e) => {
+          e.preventDefault();
+          const userIndex = savedSalespersons.findIndex(u => u.email.toLowerCase() === resetEmail.toLowerCase());
+          if (userIndex !== -1) {
+              const tempPassword = Math.random().toString(36).slice(-6);
+              const updatedUsers = [...savedSalespersons];
+              updatedUsers[userIndex] = { ...updatedUsers[userIndex], password: tempPassword, forcePasswordChange: true, sessionToken: null };
+              
+              setSavedSalespersons(updatedUsers);
+              _forceSaveToDB({ savedSalespersons: updatedUsers });
+              
+              alert(`SYSTEM MESSAGE:\n\nA password reset request has been triggered for ID: ${resetEmail}.\nYour temporary password is: ${tempPassword}\n\nPlease log in to change it.`);
+              setShowReset(false);
+              setResetEmail('');
+          } else {
+              alert("Login ID not found in our database.");
+          }
+      };
+
+      const handleForcePasswordChange = (e) => {
+          e.preventDefault();
+          if (newPasswordForm.newPassword !== newPasswordForm.confirmPassword) return alert("Passwords do not match.");
+          if (newPasswordForm.newPassword.length < 4) return alert("Password must be at least 4 characters.");
+
+          const updatedUser = { ...currentUser, password: newPasswordForm.newPassword, forcePasswordChange: false };
+          const updatedUsers = savedSalespersons.map(u => u.id === updatedUser.id ? updatedUser : u);
+          
+          setSavedSalespersons(updatedUsers);
+          setCurrentUser(updatedUser);
+          _forceSaveToDB({ savedSalespersons: updatedUsers });
+          setNewPasswordForm({ newPassword: '', confirmPassword: '' });
+          alert("Password successfully changed!");
+      };
+
+
+      // ==========================================
+      // MAIN ACTIONS (IMPORT, EXPORT, PRINT, SAVE)
+      // ==========================================
+      const handleSaveAll = async () => {
+        if (!currentUser?.permissions?.actions?.canSave) return alert("Permission denied: You do not have save rights.");
+        setIsSaving(true);
+        try {
+          await _forceSaveToDB();
+          logActivity("System", "Manually saved all settings and data.");
+          setTimeout(() => setIsSaving(false), 1500); 
+        } catch (error) {
+          alert("Error Saving: Your hard drive might be completely full or local storage limit exceeded.");
+          console.error(error);
+          setIsSaving(false);
+        }
+      };
+
+      const handlePrint = () => {
+        if (!currentUser?.permissions?.actions?.canPrint) return alert("Permission denied: You do not have print rights.");
+        if (!salesperson || salesperson.trim() === '' || !salespersonPhone || salespersonPhone.trim() === '') {
+          alert("Error: System missing salesperson details.");
+          return;
+        }
+        logActivity("Document", `Printed ${activeTab} to PDF`);
+        window.print();
+      };
+
+      const handleExport = () => {
+        if (!currentUser?.permissions?.actions?.canImportExport) return alert("Permission denied: You do not have Export rights.");
+        const dataToExport = { categories, products, headers, company, salesperson, salespersonPhone, savedCompanies, savedSalespersons, loginLogs, activityLogs, productCategories };
+        const blob = new Blob([JSON.stringify(dataToExport)], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `VG_Pricelist_Backup_${new Date().toISOString().split('T')[0]}.vgbackup`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        logActivity("System", "Exported full system backup (.vgbackup)");
+      };
+
+      const handleImport = async (e) => {
+        if (!currentUser?.permissions?.actions?.canImportExport) {
+            e.target.value = '';
+            return alert("Permission denied: You do not have Import rights.");
+        }
+        const fileInput = e.target;
+        const file = fileInput.files[0];
+        if (!file) return;
+        
+        const fileName = file.name;
+        const reader = new FileReader();
+        
+        reader.onload = async (event) => {
+          let importedData = null;
+          try {
+            const fileContent = event.target.result;
+            if (fileContent.includes("<!DOCTYPE html>") || fileContent.includes("<html")) {
+              alert("Error: It looks like you selected the HTML program file instead of the Backup Data file.");
+              fileInput.value = ''; 
+              return;
+            }
+            importedData = JSON.parse(fileContent);
+          } catch (error) {
+            alert("Error: The backup file is corrupted or invalid. Please select a valid .vgbackup or .json file.");
+            fileInput.value = '';
+            return;
+          }
+          
+          if (importedData) {
+            if (importedData.categories) setCategories(importedData.categories);
+            if (importedData.products) setProducts(importedData.products);
+            if (importedData.headers) setHeaders(importedData.headers);
+            if (importedData.company) setCompany(importedData.company);
+            if (importedData.salesperson) setSalesperson(importedData.salesperson);
+            if (importedData.salespersonPhone) setSalespersonPhone(importedData.salespersonPhone);
+            if (importedData.savedCompanies) setSavedCompanies(importedData.savedCompanies);
+            if (importedData.savedSalespersons) setSavedSalespersons(importedData.savedSalespersons);
+            if (importedData.loginLogs) setLoginLogs(importedData.loginLogs);
+            if (importedData.activityLogs) setActivityLogs(importedData.activityLogs);
+            if (importedData.productCategories) setProductCategories(importedData.productCategories);
+
+            try {
+              if (typeof window !== 'undefined' && window.localforage) {
+                await window.localforage.setItem('vg_pricelist_data', importedData);
+              } else {
+                localStorage.setItem('vg_pricelist_data', JSON.stringify(importedData));
+              }
+              setImportedFileName(fileName);
+              alert("Import successful! Data loaded.");
+              logActivity("System", `Imported system backup: ${fileName}`);
+            } catch (storageError) {
+              alert("Data displayed! However, we could not save it permanently to this computer.");
+            }
+          }
+          fileInput.value = '';
+        };
+        reader.readAsText(file);
+      };
+
+      // ==========================================
+      // EXCEL IMPORT / EXPORT / WIZARD LOGIC
+      // ==========================================
+      const exportToExcel = (dataArray, filename) => {
+          if (!window.XLSX) return alert("Excel library not loaded. Please check your internet connection.");
+          const worksheet = window.XLSX.utils.json_to_sheet(dataArray);
+          const workbook = window.XLSX.utils.book_new();
+          window.XLSX.utils.book_append_sheet(workbook, worksheet, "Sheet1");
+          window.XLSX.writeFile(workbook, `${filename}.xlsx`);
+      };
+
+      const importFromExcel = (file, callback) => {
+          if (!window.XLSX) return alert("Excel library not loaded.");
+          const reader = new FileReader();
+          reader.onload = (e) => {
+              try {
+                  const data = new Uint8Array(e.target.result);
+                  const workbook = window.XLSX.read(data, {type: 'array'});
+                  const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+                  const json = window.XLSX.utils.sheet_to_json(worksheet);
+                  callback(json);
+              } catch(err) {
+                  alert("Error reading Excel file. Ensure it is properly formatted.");
+              }
+          };
+          reader.readAsArrayBuffer(file);
+      };
+
+      const handleExcelExport = (type) => {
+          if (!currentUser?.permissions?.actions?.canImportExport) return alert("Permission denied: You do not have Export rights.");
+          
+          if (type === 'products') {
+              const flatData = products.map(p => ({
+                  ID: p.id,
+                  Name: p.name,
+                  ProductCategory: productCategories.find(c=>c.id===p.productCategoryId)?.name || '',
+                  DiscountCategory: categories.find(c=>c.id===p.categoryId)?.name || '',
+                  PackQty: p.packQty,
+                  Unit: p.unit,
+                  ImageURL: p.image,
+                  ...Object.keys(p.prices).reduce((acc, v) => {
+                      acc[`${v}_DealerBox`] = p.prices[v].dealerBox;
+                      acc[`${v}_DealerUnbox`] = p.prices[v].dealerUnbox;
+                      acc[`${v}_SellingPrice`] = p.prices[v].sellingPrice;
+                      acc[`${v}_ListPrice`] = p.prices[v].retail;
+                      return acc;
+                  }, {})
+              }));
+              exportToExcel(flatData, 'VG_Products');
+              logActivity("Export Data", "Exported Products to Excel");
+          } else if (type === 'users') {
+              const flatData = savedSalespersons.map(u => ({
+                  ID: u.id,
+                  FullName: u.name,
+                  Phone: u.phone,
+                  LoginID: u.email,
+                  Role: u.role
+              }));
+              exportToExcel(flatData, 'VG_Users');
+              logActivity("Export Data", "Exported Users to Excel");
+          } else if (type === 'categories') {
+              const flatData = productCategories.map(c => ({ ID: c.id, Name: c.name }));
+              exportToExcel(flatData, 'VG_Product_Categories');
+              logActivity("Export Data", "Exported Product Categories to Excel");
+          }
+      };
+
+      const finalizeExcelImport = (type, newItems, resolvedItems, extraUpdates) => {
+          if (type === 'products') {
+              const merged = [...products.filter(p => !resolvedItems.find(r => r.id === p.id)), ...resolvedItems, ...newItems];
+              setProducts(merged);
+          } else if (type === 'users') {
+              const merged = [...savedSalespersons.filter(u => !resolvedItems.find(r => r.id === u.id)), ...resolvedItems, ...newItems];
+              setSavedSalespersons(merged);
+          } else if (type === 'categories') {
+              const merged = [...productCategories.filter(c => !resolvedItems.find(r => r.id === c.id)), ...resolvedItems, ...newItems];
+              setProductCategories(merged);
+          }
+          
+          if (extraUpdates) {
+              if (extraUpdates.categories) setProductCategories(extraUpdates.categories);
+          }
+          
+          const totalImported = newItems.length + resolvedItems.length;
+          logActivity("Import Data", `Imported/Merged ${totalImported} ${type} via Excel`);
+          alert(`Success! Handled ${totalImported} items (Merged: ${resolvedItems.length}, Added: ${newItems.length}).`);
+      };
+
+      const handleExcelImport = (e, type) => {
+          if (!currentUser?.permissions?.actions?.canImportExport) {
+              e.target.value = null;
+              return alert("Permission denied: You do not have Import rights.");
+          }
+          const file = e.target.files[0];
+          if (!file) return;
+
+          importFromExcel(file, (json) => {
+              let queue = [];
+              let newItems = [];
+              let autoResolved = [];
+              let extraUpdates = {};
+
+              const checkDiff = (imp, ex) => {
+                  const flatImp = flattenObj(imp);
+                  const flatEx = flattenObj(ex);
+                  for (let key in flatImp) {
+                      if (key === 'id' || key.includes('permissions')) continue;
+                      
+                      const valImp = flatImp[key] !== undefined && flatImp[key] !== null ? String(flatImp[key]).trim() : '';
+                      const valEx = flatEx[key] !== undefined && flatEx[key] !== null ? String(flatEx[key]).trim() : '';
+                      
+                      if (!isNaN(valImp) && !isNaN(valEx) && valImp !== '' && valEx !== '') {
+                           if (Number(valImp) !== Number(valEx)) return true;
+                      } else if (valImp !== valEx) {
+                           // Ignore missing images from excel causing false conflict
+                           if (key === 'image' && valImp.includes('placehold.co') && valEx !== '') continue;
+                           return true;
+                      }
+                  }
+                  return false;
+              };
+
+              if (type === 'products') {
+                  json.forEach(row => {
+                      if(!row.Name && !row.ID) return;
+                      const pc = productCategories.find(c => c.name === row.ProductCategory)?.id || productCategories[0]?.id || '';
+                      const dc = categories.find(c => c.name === row.DiscountCategory)?.id || categories[0]?.id || '';
+                      
+                      const importedObj = {
+                          id: row.ID || 'prod_' + Date.now() + Math.random().toString(36).substr(2, 9),
+                          name: row.Name || 'Unnamed',
+                          productCategoryId: pc,
+                          categoryId: dc,
+                          packQty: row.PackQty?.toString() || '1',
+                          unit: row.Unit || 'pcs',
+                          image: row.ImageURL || 'https://placehold.co/200x200/f8fafc/94a3b8?text=Image',
+                          prices: {
+                              v1: { dealerBox: parseFloat(row.v1_DealerBox)||0, dealerUnbox: parseFloat(row.v1_DealerUnbox)||0, sellingPrice: parseFloat(row.v1_SellingPrice)||0, retail: parseFloat(row.v1_ListPrice)||0 },
+                              v2: { dealerBox: parseFloat(row.v2_DealerBox)||0, dealerUnbox: parseFloat(row.v2_DealerUnbox)||0, sellingPrice: parseFloat(row.v2_SellingPrice)||0, retail: parseFloat(row.v2_ListPrice)||0 },
+                              v3: { dealerBox: parseFloat(row.v3_DealerBox)||0, dealerUnbox: parseFloat(row.v3_DealerUnbox)||0, sellingPrice: parseFloat(row.v3_SellingPrice)||0, retail: parseFloat(row.v3_ListPrice)||0 },
+                              v4: { dealerBox: parseFloat(row.v4_DealerBox)||0, dealerUnbox: parseFloat(row.v4_DealerUnbox)||0, sellingPrice: parseFloat(row.v4_SellingPrice)||0, retail: parseFloat(row.v4_ListPrice)||0 }
+                          }
+                      };
+                      const existing = products.find(p => p.id == row.ID || (row.Name && p.name.toLowerCase() === row.Name.toLowerCase()));
+                      if (existing) {
+                          if (checkDiff(importedObj, existing)) {
+                              queue.push({ imported: importedObj, existing, draft: JSON.parse(JSON.stringify({...importedObj, id: existing.id})) });
+                          } else {
+                              autoResolved.push(existing);
+                          }
+                      } else {
+                          newItems.push(importedObj);
+                      }
+                  });
+              } 
+              else if (type === 'users') {
+                  json.forEach(row => {
+                      if (!row.LoginID && !row.ID) return;
+                      const rRole = rolePermissions[row.Role] ? row.Role : 'salesperson';
+                      const importedObj = {
+                          id: row.ID || 'usr_' + Date.now() + Math.random().toString(36).substr(2, 5),
+                          name: row.FullName || 'Imported User',
+                          phone: row.Phone || '-',
+                          email: row.LoginID || 'unknown@import.com',
+                          password: 'password123',
+                          role: rRole,
+                          permissions: { ...rolePermissions[rRole] },
+                          forcePasswordChange: true,
+                          sessionToken: null
+                      };
+                      const existing = savedSalespersons.find(u => u.id == row.ID || (row.LoginID && u.email === row.LoginID));
+                      if (existing) {
+                          if (checkDiff(importedObj, existing)) {
+                              queue.push({ imported: importedObj, existing, draft: JSON.parse(JSON.stringify({...importedObj, id: existing.id, password: existing.password})) }); 
+                          } else {
+                              autoResolved.push(existing);
+                          }
+                      } else {
+                          newItems.push(importedObj);
+                      }
+                  });
+              } 
+              else if (type === 'categories') {
+                  json.forEach(row => {
+                      if (!row.Name && !row.ID) return;
+                      const importedObj = { id: row.ID || 'pc' + Date.now() + Math.random().toString(36).substr(2,4), name: row.Name || 'Unnamed' };
+                      const existing = productCategories.find(c => c.id == row.ID || (row.Name && c.name === row.Name));
+                      if (existing) {
+                          if (checkDiff(importedObj, existing)) {
+                              queue.push({ imported: importedObj, existing, draft: JSON.parse(JSON.stringify({...importedObj, id: existing.id})) });
+                          } else {
+                              autoResolved.push(existing);
+                          }
+                      } else {
+                          newItems.push(importedObj);
+                      }
+                  });
+              }
+
+              if (queue.length > 0) {
+                  setMergeWizard({ isOpen: true, type, queue, currentIndex: 0, newItems, resolvedItems: autoResolved, extraUpdates });
+              } else {
+                  finalizeExcelImport(type, newItems, autoResolved, extraUpdates);
+              }
+          });
+          e.target.value = null; // reset
+      };
+
+      const handleWizardAction = (action) => {
+          const current = mergeWizard.queue[mergeWizard.currentIndex];
+          let resolvedItem = null;
+          
+          if (action === 'use_existing') {
+              resolvedItem = current.existing;
+          } else if (action === 'use_imported') {
+              resolvedItem = { ...current.imported, id: current.existing.id };
+          } else if (action === 'use_draft') {
+              resolvedItem = unflattenObj(wizardDraftFlat);
+              resolvedItem.id = current.existing.id; // Enforce existing ID for relational integrity
+          }
+          
+          const newResolvedItems = [...mergeWizard.resolvedItems, resolvedItem];
+          
+          if (mergeWizard.currentIndex < mergeWizard.queue.length - 1) {
+              setMergeWizard({ ...mergeWizard, currentIndex: mergeWizard.currentIndex + 1, resolvedItems: newResolvedItems });
+          } else {
+              finalizeExcelImport(mergeWizard.type, mergeWizard.newItems, newResolvedItems, mergeWizard.extraUpdates);
+              setMergeWizard({ isOpen: false, type: '', queue: [], currentIndex: 0, newItems: [], resolvedItems: [], extraUpdates: {} });
+          }
+      };
+
+      const handleLogExport = (e) => {
+          e.preventDefault();
+          let logsToExport = exportLogType === 'login' ? loginLogs : activityLogs;
+          
+          const startTimestamp = new Date(exportStartDate).getTime();
+          const endTimestamp = new Date(exportEndDate).setHours(23, 59, 59, 999);
+
+          logsToExport = logsToExport.filter(log => log.timestamp >= startTimestamp && log.timestamp <= endTimestamp);
+
+          if(logsToExport.length === 0) return alert("No logs found in this date range.");
+
+          const flatLogs = logsToExport.map(l => ({
+              Date: new Date(l.timestamp).toLocaleString(),
+              User: l.userName || l.userId,
+              Action: l.action || (exportLogType === 'login' ? 'Login' : ''),
+              Details: l.details || (l.lat ? `Lat: ${l.lat}, Lng: ${l.lng}` : 'Admin Bypass')
+          }));
+          
+          exportToExcel(flatLogs, `VG_${exportLogType}_Logs_${exportStartDate}_to_${exportEndDate}`);
+          logActivity('Export Data', `Exported ${logsToExport.length} ${exportLogType} logs to Excel`);
+      }
+
+      // ==========================================
+      // DATABASE & FORM HANDLERS
+      // ==========================================
+      const handleSaveCompDB = (e) => {
+        e.preventDefault();
+        if (!currentUser.permissions.company.add && !isEditingComp) return alert("Permission denied.");
+        if (!currentUser.permissions.company.edit && isEditingComp) return alert("Permission denied.");
+        
+        let actMsg = '';
+        if(isEditingComp) {
+            setSavedCompanies(savedCompanies.map(c => c.id === compForm.id ? compForm : c));
+            if(company.id === compForm.id) setCompany(compForm);
+            actMsg = `Edited Company: ${compForm.name}`;
+        } else {
+            setSavedCompanies([...savedCompanies, { ...compForm, id: Date.now().toString() }]);
+            actMsg = `Added Company: ${compForm.name}`;
+        }
+        logActivity("Database", actMsg);
+        setCompForm({ id: '', name: '', address: '', contact: '', logo: '' });
+        setIsEditingComp(false);
+      };
+      
+      const handleEditComp = (c) => { setCompForm(c); setIsEditingComp(true); };
+      const handleDeleteComp = (id) => {
+        if (!currentUser.permissions.company.remove) return alert("Permission denied.");
+        const compToDelete = savedCompanies.find(c => c.id === id);
+        if(window.confirm("Are you sure you want to delete this company profile?")) {
+            setSavedCompanies(savedCompanies.filter(c => c.id !== id));
+            if(company.id === id) setCompany({ id: '', name: '', address: '', contact: '', logo: '' });
+            logActivity("Database", `Deleted Company: ${compToDelete?.name}`);
+        }
+      };
+
+      const handleDbLogoUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onloadend = () => setCompForm({ ...compForm, logo: reader.result });
+          reader.readAsDataURL(file);
+        }
+      };
+
+      const handleSavePcDB = (e) => {
+        e.preventDefault();
+        if (!currentUser.permissions.masterData.add && !isEditingPc) return alert("Permission denied.");
+        if (!currentUser.permissions.masterData.edit && isEditingPc) return alert("Permission denied.");
+        let actMsg = '';
+        if (isEditingPc) {
+            setProductCategories(productCategories.map(c => c.id === pcForm.id ? pcForm : c));
+            actMsg = `Edited Product Category: ${pcForm.name}`;
+        } else {
+            setProductCategories([...productCategories, { ...pcForm, id: 'pc' + Date.now().toString() }]);
+            actMsg = `Added Product Category: ${pcForm.name}`;
+        }
+        logActivity("Database", actMsg);
+        setPcForm({ id: '', name: '' });
+        setIsEditingPc(false);
+      };
+      
+      const handleEditPc = (c) => { setPcForm(c); setIsEditingPc(true); };
+      const handleDeletePc = (id) => {
+        if (!currentUser.permissions.masterData.remove) return alert("Permission denied.");
+        const catToDelete = productCategories.find(c => c.id === id);
+        if (window.confirm("Delete this Product Category? This will remove the category tag from any assigned products.")) {
+            setProductCategories(productCategories.filter(c => c.id !== id));
+            setProducts(products.map(p => p.productCategoryId === id ? { ...p, productCategoryId: '' } : p));
+            logActivity("Database", `Deleted Product Category: ${catToDelete?.name}`);
+        }
+      };
+
+      const handleRoleChangeForSpForm = (e) => {
+          const newRole = e.target.value;
+          let basePerms = JSON.parse(JSON.stringify(rolePermissions[newRole]));
+          
+          // Mask the preset permissions so non-admins cannot grant what they don't have
+          if (currentUser.role !== 'admin') {
+              for (const category in basePerms) {
+                  for (const action in basePerms[category]) {
+                      if (basePerms[category][action] === true && !currentUser.permissions[category][action]) {
+                          basePerms[category][action] = false;
+                      }
+                  }
+              }
+          }
+          
+          setSpForm({ ...spForm, role: newRole, permissions: basePerms });
+      };
+
+      const handleNestedPermissionToggle = (category, action) => {
+          setSpForm({
+             ...spForm,
+             permissions: {
+                ...spForm.permissions,
+                [category]: { ...spForm.permissions[category], [action]: !spForm.permissions[category][action] }
+             }
+          });
+      };
+
+      const handleActionPermissionToggle = (category, action) => {
+           setSpForm({
+             ...spForm,
+             permissions: {
+                ...spForm.permissions,
+                [category]: { ...spForm.permissions[category], [action]: !spForm.permissions[category][action] }
+             }
+          });
+      };
+
+      const handleSaveSpDB = (e) => {
+        e.preventDefault();
+        if (!currentUser.permissions.users.add && !isEditingSp) return alert("Permission denied.");
+        if (!currentUser.permissions.users.edit && isEditingSp) return alert("Permission denied.");
+        
+        let actMsg = '';
+        if(isEditingSp) {
+            setSavedSalespersons(savedSalespersons.map(s => s.id === spForm.id ? spForm : s));
+            if(salesperson === savedSalespersons.find(s => s.id === spForm.id)?.name) {
+                setSalesperson(spForm.name);
+                setSalespersonPhone(spForm.phone);
+            }
+            if (currentUser.id === spForm.id) setCurrentUser({...spForm});
+            actMsg = `Edited User: ${spForm.name}`;
+        } else {
+            setSavedSalespersons([...savedSalespersons, { ...spForm, id: Date.now().toString(), forcePasswordChange: false, sessionToken: null }]);
+            actMsg = `Added User: ${spForm.name}`;
+        }
+        logActivity("Database", actMsg);
+        setSpForm({ id: '', name: '', phone: '', email: '', password: '', role: 'salesperson', permissions: {...rolePermissions.salesperson} });
+        setIsEditingSp(false);
+      };
+
+      const handleEditSp = (s) => { setSpForm(s); setIsEditingSp(true); };
+
+      const handleDeleteSp = (id) => {
+        if (!currentUser.permissions.users.remove) return alert("Permission denied.");
+        if (currentUser.id === id) return alert("You cannot delete your own active account.");
+        const usrToDelete = savedSalespersons.find(s => s.id === id);
+        if(window.confirm("Are you sure you want to delete this user profile?")) {
+            setSavedSalespersons(savedSalespersons.filter(s => s.id !== id));
+            logActivity("Database", `Deleted User: ${usrToDelete?.name}`);
+        }
+      };
+
+
+      // ==========================================
+      // PRICELIST & PRODUCT HANDLERS
+      // ==========================================
+      const updateCategory = (id, field, value) => {
+          if (!currentUser.permissions.discounts.edit) return;
+          setCategories(categories.map(c => c.id === id ? { ...c, [field]: field === 'discount' ? parseFloat(value) || 0 : value } : c));
+      };
+      const addCategory = () => {
+          if (!currentUser.permissions.discounts.add) return;
+          setCategories([...categories, { id: Date.now().toString(), name: 'New Discount', discount: 0 }]);
+          logActivity("Data", "Added new Base Discount category");
+      };
+      const removeCategory = (id) => {
+          if (!currentUser.permissions.discounts.remove) return;
+          setCategories(categories.filter(c => c.id !== id));
+          setProducts(products.map(p => p.categoryId === id ? { ...p, categoryId: '' } : p));
+          logActivity("Data", "Removed Base Discount category");
+      };
+      
+      const updateProductCategory = (productId, categoryId) => {
+          if (!currentUser.permissions.products.edit) return;
+          setProducts(products.map(p => p.id === productId ? { ...p, categoryId } : p));
+      };
+
+      const executeDeleteProduct = () => {
+        if (!currentUser.permissions.products.remove) return;
+        if (productToDelete) { 
+            const pName = products.find(p => p.id === productToDelete)?.name;
+            setProducts(products.filter(p => p.id !== productToDelete)); 
+            setProductToDelete(null); 
+            logActivity("Data", `Deleted Product: ${pName}`);
+        }
+      };
+
+      const moveProductUp = (absoluteIndex) => {
+        if (!currentUser.permissions.products.edit) return;
+        if (absoluteIndex <= 0) return;
+        const newProducts = [...products];
+        const temp = newProducts[absoluteIndex];
+        newProducts[absoluteIndex] = newProducts[absoluteIndex - 1];
+        newProducts[absoluteIndex - 1] = temp;
+        setProducts(newProducts);
+      };
+
+      const moveProductDown = (absoluteIndex) => {
+        if (!currentUser.permissions.products.edit) return;
+        if (absoluteIndex >= products.length - 1) return;
+        const newProducts = [...products];
+        const temp = newProducts[absoluteIndex];
+        newProducts[absoluteIndex] = newProducts[absoluteIndex + 1];
+        newProducts[absoluteIndex + 1] = temp;
+        setProducts(newProducts);
+      };
+
+      const handleImageUpload = (e) => {
+        if (!currentUser.permissions.products.add && !currentUser.permissions.products.edit) return;
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onloadend = () => setNewProduct({ ...newProduct, image: reader.result });
+          reader.readAsDataURL(file);
+        }
+      };
+
+      const handleAddProductSubmit = (e) => {
+        e.preventDefault();
+        if (!currentUser.permissions.products.add) return;
+        const productToAdd = {
+          id: Date.now(),
+          name: newProduct.name || 'Unnamed Product',
+          categoryId: newProduct.categoryId || categories[0]?.id,
+          productCategoryId: newProduct.productCategoryId || productCategories[0]?.id || '',
+          image: newProduct.image || `https://placehold.co/200x200/f8fafc/94a3b8?text=Image`,
+          packQty: newProduct.packQty || '-',
+          unit: newProduct.unit || '-',
+          prices: {
+            v1: { dealerBox: parseFloat(newProduct.v1DealerBox) || 0, dealerUnbox: parseFloat(newProduct.v1DealerUnbox) || 0, sellingPrice: parseFloat(newProduct.v1SellingPrice) || 0, retail: parseFloat(newProduct.v1Retail) || 0 },
+            v2: { dealerBox: parseFloat(newProduct.v2DealerBox) || 0, dealerUnbox: parseFloat(newProduct.v2DealerUnbox) || 0, sellingPrice: parseFloat(newProduct.v2SellingPrice) || 0, retail: parseFloat(newProduct.v2Retail) || 0 },
+            v3: { dealerBox: parseFloat(newProduct.v3DealerBox) || 0, dealerUnbox: parseFloat(newProduct.v3DealerUnbox) || 0, sellingPrice: parseFloat(newProduct.v3SellingPrice) || 0, retail: parseFloat(newProduct.v3Retail) || 0 },
+            v4: { dealerBox: parseFloat(newProduct.v4DealerBox) || 0, dealerUnbox: parseFloat(newProduct.v4DealerUnbox) || 0, sellingPrice: parseFloat(newProduct.v4SellingPrice) || 0, retail: parseFloat(newProduct.v4Retail) || 0 }
+          }
+        };
+        setProducts([...products, productToAdd]);
+        setIsModalOpen(false);
+        logActivity("Data", `Added Product: ${productToAdd.name}`);
+      };
+
+      const toggleProductCategory = (id) => {
+         if (id === 'all') {
+             setSelectedProductCategories(['all']);
+         } else {
+             let newSel = selectedProductCategories.filter(catId => catId !== 'all');
+             if (newSel.includes(id)) {
+                 newSel = newSel.filter(catId => catId !== id);
+                 if (newSel.length === 0) newSel = ['all'];
+             } else {
+                 newSel.push(id);
+             }
+             setSelectedProductCategories(newSel);
+         }
+      };
+
+      const filteredProducts = useMemo(() => {
+          return products.filter(p => 
+              selectedProductCategories.includes('all') || 
+              selectedProductCategories.includes(p.productCategoryId)
+          );
+      }, [products, selectedProductCategories]);
+
+
+      // ==========================================
+      // REUSABLE COMPONENTS
+      // ==========================================
+      const PrintHeader = ({ title, subtitle }) => {
+        return (
+          <div className="hidden print:block mb-6 w-full relative">
+            <div className="absolute top-0 left-0 w-full h-[3px] bg-slate-900"></div>
+            <div className="flex justify-between items-start pt-6 pb-6 border-b border-gray-300 mb-6">
+              <div className="flex items-center gap-6">
+                {company.logo && <img src={company.logo} alt="Logo" className="w-24 h-24 object-contain" />}
+                <div className="flex-1 mt-1">
+                  <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight leading-tight">{company.name}</h1>
+                  <p className="text-[11px] text-gray-600 mt-2 whitespace-pre-wrap leading-relaxed">{company.address}</p>
+                  <p className="text-[11px] text-gray-600 mt-0.5">{company.contact}</p>
+                </div>
+              </div>
+              <div className="text-right mt-1 flex flex-col justify-start">
+                <h2 className="text-2xl font-black text-slate-900 uppercase tracking-widest">{title}</h2>
+                {subtitle && <p className="text-sm font-bold text-gray-500 tracking-widest mt-1">{subtitle}</p>}
+                <p className="text-xs font-semibold text-gray-800 mt-4">Date: <span className="font-normal">{new Date().toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></p>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      const PrintFooterSignature = () => (
+        <div className="hidden print:block mt-12 pt-6 page-break-inside-avoid relative">
+          <div className="absolute top-0 left-12 right-12 border-t border-gray-300"></div>
+          <div className="flex justify-between text-center px-16 items-start">
+            <div className="w-64 flex flex-col items-center">
+              <div className="h-20 w-full"></div>
+              <div className="border-b border-gray-400 w-56 mb-2"></div>
+              <p className="text-sm font-extrabold text-slate-900">{salesperson}</p>
+              <p className="text-[10px] text-gray-600 mt-0.5">เบอร์ติดต่อ: {salespersonPhone}</p>
+              <p className="text-[10px] text-slate-500 mt-1.5 uppercase tracking-wider font-semibold">Salesperson</p>
+            </div>
+            <div className="w-64 flex flex-col items-center">
+              <div className="h-20 w-full"></div>
+              <div className="border-b border-gray-400 w-56 mb-2"></div>
+              <p className="text-[10px] text-slate-500 mt-1.5 uppercase tracking-wider font-semibold">Authorized Signature</p>
+            </div>
+          </div>
+        </div>
+      );
+
+
+      // ==========================================
+      // EARLY RETURNS FOR AUTHENTICATION
+      // ==========================================
+      if (isInitializing) {
+          return <div className="min-h-screen bg-gray-100 flex items-center justify-center"><i className="fas fa-spinner fa-spin text-4xl text-blue-600"></i></div>;
+      }
+
+      if (currentUser && currentUser.forcePasswordChange) {
+          return (
+            <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+               <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-8 animate-in fade-in zoom-in-95">
+                  <div className="text-center mb-6">
+                      <div className="w-16 h-16 bg-yellow-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <i className="fas fa-key text-yellow-600 text-2xl"></i>
+                      </div>
+                      <h2 className="text-2xl font-black text-slate-900 tracking-tight">Security Update</h2>
+                      <p className="text-sm text-gray-500 mt-2">You are using a temporary password. Please create a new password to continue.</p>
+                  </div>
+                  <form onSubmit={handleForcePasswordChange} className="space-y-4">
+                      <div>
+                        <label className="block text-xs font-bold text-gray-700 mb-1">New Password</label>
+                        <input type="password" required minLength="4" value={newPasswordForm.newPassword} onChange={e=>setNewPasswordForm({...newPasswordForm, newPassword: e.target.value})} className="w-full p-2.5 border rounded outline-none focus:border-blue-500 bg-gray-50" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-gray-700 mb-1">Confirm Password</label>
+                        <input type="password" required minLength="4" value={newPasswordForm.confirmPassword} onChange={e=>setNewPasswordForm({...newPasswordForm, confirmPassword: e.target.value})} className="w-full p-2.5 border rounded outline-none focus:border-blue-500 bg-gray-50" />
+                      </div>
+                      <button type="submit" className="w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 transition-colors shadow mt-4">Save & Continue</button>
+                  </form>
+               </div>
+            </div>
+          );
+      }
+
+      if (!currentUser) {
+          return (
+            <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 relative overflow-hidden">
+               <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full bg-blue-900/40 blur-3xl"></div>
+               <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-blue-800/20 blur-3xl"></div>
+
+               <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8 relative z-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                  
+                  {!showReset ? (
+                      <>
+                        <div className="text-center mb-8">
+                            <i className="fas fa-shield-alt text-blue-600 text-4xl mb-3"></i>
+                            <h2 className="text-2xl font-black text-slate-900 tracking-tight">Secure Login</h2>
+                            <p className="text-sm text-gray-500 mt-1">Location access is required to connect.</p>
+                        </div>
+                        <form onSubmit={handleLogin} className="space-y-5">
+                            <div>
+                              <label className="block text-xs font-bold text-gray-700 mb-1">Login ID</label>
+                              <div className="relative">
+                                  <i className="fas fa-user absolute left-3 top-3 text-gray-400"></i>
+                                  <input type="text" required value={loginForm.loginId} onChange={e=>setLoginForm({...loginForm, loginId: e.target.value})} className="w-full pl-9 pr-3 py-2.5 border rounded outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-gray-50 transition-all" placeholder="admin / name@company.com" disabled={isLoggingIn} />
+                              </div>
+                            </div>
+                            <div>
+                              <div className="flex justify-between mb-1">
+                                <label className="block text-xs font-bold text-gray-700">Password</label>
+                                <button type="button" onClick={() => setShowReset(true)} className="text-[11px] font-bold text-blue-600 hover:underline" disabled={isLoggingIn}>Forgot password?</button>
+                              </div>
+                              <div className="relative">
+                                  <i className="fas fa-lock absolute left-3 top-3 text-gray-400"></i>
+                                  <input type="password" required value={loginForm.password} onChange={e=>setLoginForm({...loginForm, password: e.target.value})} className="w-full pl-9 pr-3 py-2.5 border rounded outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-gray-50 transition-all" placeholder="••••••••" disabled={isLoggingIn} />
+                              </div>
+                            </div>
+                            <button type="submit" disabled={isLoggingIn} className="w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 disabled:bg-blue-400 disabled:cursor-not-allowed transition-transform active:scale-95 shadow mt-2 flex justify-center items-center gap-2">
+                                {isLoggingIn ? <><i className="fas fa-spinner fa-spin"></i> Locating...</> : 'Sign In'}
+                            </button>
+                        </form>
+                      </>
+                  ) : (
+                      <>
+                        <div className="text-center mb-8">
+                            <i className="fas fa-unlock-alt text-blue-600 text-4xl mb-3"></i>
+                            <h2 className="text-2xl font-black text-slate-900 tracking-tight">Reset Password</h2>
+                            <p className="text-sm text-gray-500 mt-1">Enter your ID to receive a temporary password.</p>
+                        </div>
+                        <form onSubmit={handleForgotPassword} className="space-y-5">
+                            <div>
+                              <label className="block text-xs font-bold text-gray-700 mb-1">Login ID</label>
+                              <div className="relative">
+                                  <i className="fas fa-user absolute left-3 top-3 text-gray-400"></i>
+                                  <input type="text" required value={resetEmail} onChange={e=>setResetEmail(e.target.value)} className="w-full pl-9 pr-3 py-2.5 border rounded outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-gray-50 transition-all" placeholder="Enter your Login ID" />
+                              </div>
+                            </div>
+                            <div className="flex flex-col gap-2 pt-2">
+                                <button type="submit" className="w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 transition-transform active:scale-95 shadow">Send Reset Link</button>
+                                <button type="button" onClick={() => setShowReset(false)} className="w-full py-3 bg-gray-100 text-gray-700 rounded-lg font-bold hover:bg-gray-200 transition-colors">Back to Login</button>
+                            </div>
+                        </form>
+                      </>
+                  )}
+               </div>
+            </div>
+          );
+      }
+
+      // --- HELPER RENDERING FUNCTIONS ---
+      const renderCrudCheckboxes = (label, categoryKey) => (
+          <div className="flex flex-col gap-1.5 border-b border-gray-200 pb-2 mb-2">
+             <span className="text-[11px] font-bold text-gray-800">{label}</span>
+             <div className="flex gap-4">
+                 {['view', 'add', 'edit', 'remove'].map(action => {
+                    const isDisabled = currentUser.role !== 'admin' && !currentUser.permissions[categoryKey][action];
+                    return (
+                    <label key={action} className={`flex items-center gap-1.5 text-[10px] font-medium ${isDisabled ? 'text-gray-400 cursor-not-allowed' : 'text-gray-600 cursor-pointer hover:text-blue-600'}`}>
+                        <input type="checkbox" checked={spForm.permissions[categoryKey][action]} 
+                           onChange={() => !isDisabled && handleNestedPermissionToggle(categoryKey, action)}
+                           disabled={isDisabled}
+                           className={`rounded w-3 h-3 ${isDisabled ? 'bg-gray-200 border-gray-300' : 'text-blue-600 focus:ring-blue-500 cursor-pointer'}`} />
+                        <span className="capitalize">{action}</span>
+                    </label>
+                 )})}
+             </div>
+          </div>
+      );
+
+      const renderSystemCheckbox = (label, category, key, isAction = false) => {
+          const hasPerm = currentUser.permissions[category][key];
+          const isDisabled = currentUser.role !== 'admin' && !hasPerm;
+          const toggleFn = isAction ? handleActionPermissionToggle : handleNestedPermissionToggle;
+          return (
+             <label className={`flex items-center gap-2 text-[10px] font-medium ${isDisabled ? 'text-gray-400 cursor-not-allowed' : 'text-gray-700 cursor-pointer'}`}>
+                 <input type="checkbox" checked={spForm.permissions[category][key]} onChange={() => !isDisabled && toggleFn(category, key)} disabled={isDisabled} className={`rounded w-3 h-3 ${isDisabled ? 'bg-gray-200 border-gray-300' : 'text-blue-600 focus:ring-blue-500 cursor-pointer'}`} /> {label}
+             </label>
+          );
+      };
+
+      const renderProductCategoryFilter = () => (
+        <div className="print:hidden mb-4 bg-gray-50 border border-gray-200 p-3 rounded-lg flex flex-col sm:flex-row items-start sm:items-center gap-3">
+          <div className="relative">
+             <button 
+               onClick={() => setIsFilterDropdownOpen(!isFilterDropdownOpen)}
+               className="flex items-center gap-2 bg-white border border-gray-300 text-gray-700 text-xs font-bold py-1.5 px-4 rounded-full hover:bg-gray-100 shadow-sm transition-colors"
+             >
+               <i className="fas fa-filter text-blue-500"></i> Filter Categories <i className="fas fa-chevron-down text-[10px] ml-1"></i>
+             </button>
+             
+             {isFilterDropdownOpen && (
+               <>
+                 <div className="fixed inset-0 z-40" onClick={() => setIsFilterDropdownOpen(false)}></div>
+                 <div className="absolute top-full left-0 mt-2 w-64 bg-white border border-gray-200 rounded-lg shadow-xl z-50 p-2">
+                    <div className="flex flex-col gap-1">
+                      <label className="flex items-center gap-2 px-2 py-1.5 hover:bg-slate-50 rounded cursor-pointer text-sm">
+                        <input 
+                          type="checkbox" 
+                          checked={selectedProductCategories.includes('all')} 
+                          onChange={() => toggleProductCategory('all')} 
+                          className="rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
+                        />
+                        <span className={selectedProductCategories.includes('all') ? 'font-bold text-blue-600' : 'font-medium text-gray-700'}>All Products</span>
+                      </label>
+                      <div className="h-px bg-gray-100 my-1"></div>
+                      {productCategories.map(cat => (
+                        <label key={cat.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-slate-50 rounded cursor-pointer text-sm">
+                          <input 
+                            type="checkbox" 
+                            checked={selectedProductCategories.includes(cat.id)} 
+                            onChange={() => toggleProductCategory(cat.id)} 
+                            className="rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
+                          />
+                          <span className={selectedProductCategories.includes(cat.id) ? 'font-bold text-blue-600' : 'font-medium text-gray-700'}>{cat.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                 </div>
+               </>
+             )}
+          </div>
+
+          <div className="flex gap-2 flex-wrap flex-1 items-center">
+            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mr-1">Active:</span>
+            {selectedProductCategories.includes('all') ? (
+               <span className="bg-blue-100 text-blue-800 text-[10px] font-bold px-2.5 py-1 rounded-full border border-blue-200 shadow-sm">
+                  All Products
+               </span>
+            ) : (
+               selectedProductCategories.map(catId => {
+                  const cat = productCategories.find(c => c.id === catId);
+                  if (!cat) return null;
+                  return (
+                     <span key={cat.id} className="bg-blue-100 text-blue-800 text-[10px] font-bold px-2.5 py-1 rounded-full border border-blue-200 shadow-sm flex items-center gap-1.5 animate-in zoom-in-95">
+                        {cat.name}
+                        <button onClick={() => toggleProductCategory(cat.id)} className="text-blue-400 hover:text-red-500 flex items-center justify-center transition-colors">
+                            <i className="fas fa-times"></i>
+                        </button>
+                     </span>
+                  );
+               })
+            )}
+          </div>
+        </div>
+      );
+
+
+      // ==========================================
+      // MAIN RENDER APP UI
+      // ==========================================
+      return (
+        <div className="min-h-screen bg-gray-100 text-slate-800 font-sans pb-12 relative">
+          
+          {/* TOP NAVIGATION */}
+          <header className="bg-blue-900 text-white shadow-md print:hidden sticky top-0 z-30">
+            <div className="max-w-[1400px] mx-auto px-4 flex justify-between items-center h-16">
+              <div className="flex items-center gap-3">
+                <i className="fas fa-image text-blue-300 text-2xl"></i>
+                <span className="text-xl font-bold tracking-wide">Pricelist Manager</span>
+              </div>
+              
+              <div className="flex space-x-1 bg-blue-950 p-1 rounded-lg">
+                {currentUser.permissions.tabs.lpPricelist && (
+                    <button 
+                      onClick={() => setActiveTab('lpPricelist')}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${activeTab === 'lpPricelist' ? 'bg-blue-600 text-white shadow' : 'text-blue-200 hover:text-white hover:bg-blue-800'}`}
+                    >
+                      <i className="fas fa-list text-[14px]"></i> LP Pricelist
+                    </button>
+                )}
+                {currentUser.permissions.tabs.simplePricelist && (
+                    <button 
+                      onClick={() => setActiveTab('simplePricelist')}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${activeTab === 'simplePricelist' ? 'bg-blue-600 text-white shadow' : 'text-blue-200 hover:text-white hover:bg-blue-800'}`}
+                    >
+                      <i className="fas fa-file-alt text-[14px]"></i> Simple Pricelist
+                    </button>
+                )}
+                {(currentUser.permissions.users.view || currentUser.permissions.company.view || currentUser.permissions.masterData.view || currentUser.role === 'admin') && (
+                  <button 
+                    onClick={() => setActiveTab('databases')}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${activeTab === 'databases' ? 'bg-blue-600 text-white shadow' : 'text-blue-200 hover:text-white hover:bg-blue-800'}`}
+                  >
+                    <i className="fas fa-database text-[14px]"></i> Databases
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                {currentUser.permissions.actions.canImportExport && (
+                    <div className="flex gap-2">
+                        <label className="flex items-center gap-1.5 bg-yellow-600 hover:bg-yellow-500 text-white px-3 py-1.5 rounded-md text-xs font-bold transition-all shadow-sm cursor-pointer" title="Import Data Backup (.vgbackup)">
+                          <i className="fas fa-file-import text-[14px]"></i> Backup
+                          <input type="file" accept=".vgbackup,.json,.txt,*/*" onChange={handleImport} className="hidden" />
+                        </label>
+                        <button 
+                          onClick={handleExport} 
+                          className="flex items-center gap-1.5 bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded-md text-xs font-bold transition-all shadow-sm" title="Download Data Backup (.vgbackup)"
+                        >
+                          <i className="fas fa-file-export text-[14px]"></i> Backup
+                        </button>
+                        <div className="w-px h-8 bg-blue-800 mx-1"></div>
+                    </div>
+                )}
+
+                {currentUser.permissions.actions.canSave && (
+                    <button 
+                      onClick={handleSaveAll} 
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-bold transition-all ${isSaving ? 'bg-green-500 text-white' : 'bg-green-600 hover:bg-green-500 text-white'}`}
+                    >
+                      {isSaving ? <i className="fas fa-check text-[14px]"></i> : <i className="fas fa-save text-[14px]"></i>}
+                      {isSaving ? 'Saved!' : 'Save'}
+                    </button>
+                )}
+                
+                {activeTab === 'lpPricelist' && currentUser.permissions.products.add && (
+                  <button onClick={() => setIsModalOpen(true)} className="flex items-center gap-1.5 bg-white text-blue-900 hover:bg-blue-50 px-3 py-1.5 rounded-md text-xs font-bold transition-colors">
+                    <i className="fas fa-plus text-[14px]"></i> Add Product
+                  </button>
+                )}
+
+                {currentUser.permissions.actions.canPrint && (
+                  <button onClick={handlePrint} className="flex items-center gap-1.5 bg-blue-500 hover:bg-blue-400 text-white px-3 py-1.5 rounded-md text-xs font-bold transition-colors shadow-sm">
+                    <i className="fas fa-print text-[14px]"></i> Print PDF
+                  </button>
+                )}
+
+                {/* Profile / Logout Menu */}
+                <div className="ml-2 pl-3 border-l border-blue-800 flex items-center gap-3">
+                    <div className="text-right hidden md:block">
+                        <p className="text-[11px] font-bold text-white leading-tight">{currentUser.name}</p>
+                        <p className="text-[9px] text-blue-300 uppercase tracking-widest">{currentUser.role}</p>
+                    </div>
+                    <button onClick={handleLogout} className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-800 hover:bg-red-500 text-white transition-colors" title="Log Out">
+                       <i className="fas fa-sign-out-alt text-[14px]"></i>
+                       <span className="text-xs font-bold hidden md:inline">Log Out</span>
+                    </button>
+                </div>
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-[1400px] mx-auto mt-6 px-4 grid grid-cols-1 lg:grid-cols-5 gap-6">
+            
+            {/* --- LEFT SIDEBAR --- */}
+            <aside className="lg:col-span-1 print:hidden space-y-6">
+              
+              <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+                <div className="flex justify-between items-center mb-4 border-b pb-2">
+                  <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+                    <i className="fas fa-building text-[16px] text-blue-600"></i>
+                    Company Info
+                  </h2>
+                </div>
+                <div className="space-y-3">
+                  <select 
+                    value={company.id || ''} 
+                    onChange={(e) => {
+                      const selected = savedCompanies.find(c => c.id === e.target.value);
+                      if (selected) setCompany(selected);
+                      else setCompany({ id: '', name: '', address: '', contact: '', logo: '' });
+                    }}
+                    disabled={activeTab !== 'lpPricelist' && activeTab !== 'simplePricelist'}
+                    className={`w-full text-xs p-1.5 border rounded outline-none font-bold text-blue-900 shadow-sm ${activeTab === 'databases' ? 'bg-gray-100 cursor-not-allowed' : 'bg-blue-50 focus:border-blue-500 cursor-pointer'}`}
+                  >
+                    <option value="" disabled>-- Select Company --</option>
+                    {savedCompanies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+
+                  <textarea 
+                    value={company.address} 
+                    readOnly
+                    className="w-full text-[11px] p-2 border rounded outline-none h-20 resize-none bg-gray-50 text-gray-600 cursor-default" 
+                    placeholder="Address & Tax ID (Select from list above)" 
+                  />
+                  <input 
+                    type="text" 
+                    value={company.contact} 
+                    readOnly
+                    className="w-full text-[11px] p-2 border rounded outline-none bg-gray-50 text-gray-600 cursor-default" 
+                    placeholder="Contact Info (Select from list above)" 
+                  />
+                  <div className="flex items-center gap-3">
+                    {company.logo ? (
+                      <img src={company.logo} alt="Logo" className="w-10 h-10 object-contain border rounded bg-white shadow-sm" />
+                    ) : (
+                      <div className="w-10 h-10 border rounded bg-gray-100 flex items-center justify-center text-gray-400"><i className="fas fa-image"></i></div>
+                    )}
+                    <span className="text-[10px] text-gray-500 italic flex-1">Configure in Databases tab</span>
+                  </div>
+                  
+                  {/* Salesperson Box (Locked) */}
+                  <div className="pt-3 border-t border-gray-200 mt-4">
+                    <label className="block text-[11px] font-bold text-gray-700 mb-1">
+                      Salesperson Name
+                    </label>
+                    <input 
+                      type="text" 
+                      value={salesperson} 
+                      readOnly
+                      className="w-full text-xs p-1.5 border rounded outline-none bg-gray-50 text-gray-600 font-bold cursor-default" 
+                    />
+
+                    <label className="block text-[11px] font-bold text-gray-700 mb-1 mt-2">
+                      Phone Number
+                    </label>
+                    <input 
+                      type="text" 
+                      value={salespersonPhone} 
+                      readOnly
+                      className="w-full text-xs p-1.5 border rounded outline-none bg-gray-50 text-gray-600 font-bold cursor-default" 
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {(activeTab === 'lpPricelist' || activeTab === 'databases') && currentUser.permissions.discounts.view && (
+                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 animate-in fade-in slide-in-from-top-4">
+                  <div className="flex justify-between items-center mb-4 border-b pb-2">
+                      <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+                        <i className="fas fa-cog text-[16px] text-blue-600"></i> Base Discounts (%)
+                      </h2>
+                      {!currentUser.permissions.discounts.edit && <span className="text-[10px] text-red-500">(Read-Only)</span>}
+                  </div>
+                  <div className="space-y-3">
+                    {categories.map((cat) => (
+                      <div key={cat.id} className="flex gap-2 items-center bg-slate-50 p-1.5 rounded border border-slate-100 group">
+                        <input type="text" disabled={!currentUser.permissions.discounts.edit} value={cat.name} onChange={(e) => updateCategory(cat.id, 'name', e.target.value)} className="w-full text-xs font-medium bg-transparent outline-none px-1 disabled:opacity-80" />
+                        <div className="relative w-20 flex-shrink-0">
+                          <input type="number" disabled={!currentUser.permissions.discounts.edit} value={cat.discount} onChange={(e) => updateCategory(cat.id, 'discount', e.target.value)} className="w-full pl-2 pr-5 py-1 text-xs border border-gray-300 rounded outline-none disabled:bg-gray-100" />
+                          <i className="fas fa-percent text-[10px] absolute right-1.5 top-1.5 text-gray-400"></i>
+                        </div>
+                        {currentUser.permissions.discounts.remove && (
+                            <button 
+                              onClick={() => removeCategory(cat.id)} 
+                              className="text-red-400 hover:text-red-600 opacity-50 group-hover:opacity-100 transition-opacity p-0.5" 
+                              title="Remove Category"
+                            >
+                              <i className="fas fa-trash text-[14px]"></i>
+                            </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  {currentUser.permissions.discounts.add && (
+                      <button onClick={addCategory} className="mt-3 w-full text-xs text-blue-600 font-semibold border border-dashed border-blue-300 rounded py-1.5 hover:bg-blue-50">
+                        + Add Category
+                      </button>
+                  )}
+                </div>
+              )}
+
+              {activeTab === 'simplePricelist' && currentUser.permissions.discounts.view && (
+                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 animate-in fade-in slide-in-from-top-4 print:hidden">
+                  <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2 mb-4 border-b pb-2">
+                    <i className="fas fa-info-circle text-[16px] text-blue-600"></i>
+                    Applied Discounts
+                  </h2>
+                  <p className="text-xs text-gray-500 mb-3">Discounts applied to Dealer (ครบลัง) prices.</p>
+                  <div className="space-y-2">
+                    {categories.map((cat) => (
+                      <div key={cat.id} className="flex justify-between items-center bg-slate-50 p-2 rounded border border-slate-100">
+                        <span className="text-xs font-medium text-gray-700">{cat.name}</span>
+                        <span className="text-xs font-bold text-gray-900">{cat.discount}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </aside>
+
+            {/* --- MAIN CONTENT AREA --- */}
+            <section className={`lg:col-span-4 bg-white rounded-xl shadow-sm border border-gray-200 p-6 min-h-[700px] ${activeTab === 'databases' ? 'print:hidden' : ''}`}>
+              
+              {/* TAB 1: LP PRICELIST */}
+              {activeTab === 'lpPricelist' && (
+                <div className="animate-in fade-in duration-300">
+                  <PrintHeader title="VG PRODUCT PRICELIST (LP)" subtitle="(ใบแจ้งราคา)" />
+                  
+                  {renderProductCategoryFilter()}
+
+                  <div className="overflow-x-auto print:overflow-visible">
+                    <table className="w-full text-left border-collapse min-w-[900px] print:min-w-0">
+                      <thead>
+                        <tr className="bg-slate-900 text-white text-sm print:text-[11px] uppercase tracking-wider align-middle text-center">
+                          <th className="p-3 font-bold text-center align-middle border-r border-slate-800 print:w-[28%]">
+                            Products
+                            <span className="block text-[10px] font-normal text-gray-300 print:text-[9px] mt-0.5">(รายการสินค้า)</span>
+                          </th>
+                          <th className="p-3 font-bold text-center align-middle w-20 border-r border-slate-800 print:w-[12%]">
+                            Pack Size
+                            <span className="block text-[10px] font-normal text-gray-300 print:text-[9px] mt-0.5">(ขนาดแพ็ค)</span>
+                          </th>
+                          {['v1', 'v2', 'v3', 'v4'].map((v, i) => (
+                            <th key={v} className={`p-2 font-bold text-center align-middle border-r border-slate-800 ${i%2===0 ? 'bg-slate-800' : 'bg-slate-900'}`}>
+                              <input type="text" disabled={!currentUser.permissions.products.edit} value={headers[v]} onChange={(e) => setHeaders({...headers, [v]: e.target.value})} className="bg-transparent text-center font-bold w-full outline-none hover:bg-white/10 focus:bg-white/10 rounded print:hidden disabled:hover:bg-transparent" />
+                              <div className="hidden print:flex flex-col items-center justify-center w-full">
+                                <span className="tracking-wide text-sm print:text-[11px]">{headers[v].split(' (')[0]}</span>
+                                {headers[v].includes(' (') && <span className="block text-[10px] font-normal text-gray-300 print:text-[9px] mt-0.5">({headers[v].split(' (')[1]}</span>}
+                              </div>
+                            </th>
+                          ))}
+                          {(currentUser.permissions.products.edit || currentUser.permissions.products.remove) && <th className="p-2 w-16 text-center align-middle bg-slate-900 print:hidden"></th>}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200">
+                        {filteredProducts.map((product) => {
+                          const absoluteIndex = products.findIndex(p => p.id === product.id);
+                          return (
+                          <tr key={product.id} className="hover:bg-slate-50 group bg-white">
+                            <td className="p-3 border-r border-gray-200 align-middle">
+                              <p className="font-extrabold text-slate-900 leading-snug print:text-[12px]">{product.name}</p>
+                              <img src={product.image} alt="" className="w-24 h-24 print:w-32 print:h-32 object-contain rounded border border-gray-200 my-2 print:mx-auto" />
+                              <select disabled={!currentUser.permissions.products.edit} value={product.categoryId} onChange={(e) => updateProductCategory(product.id, e.target.value)} className="mt-1 text-[11px] text-blue-700 bg-blue-50 border border-blue-200 rounded px-1 py-0.5 outline-none print:hidden disabled:opacity-80 disabled:cursor-not-allowed">
+                                {categories.map(c => <option key={c.id} value={c.id}>{c.name} ({c.discount}%)</option>)}
+                              </select>
+                            </td>
+                            {/* Pack Size +25% */}
+                            <td className="p-2 text-center border-r border-gray-200 align-middle">
+                              <p className="font-bold text-[15px] text-slate-800 print:text-[13px]">{product.packQty}</p>
+                              <p className="text-[11px] text-slate-500 font-medium print:text-[10px]">{product.unit}</p>
+                            </td>
+                            {/* Prices +10% */}
+                            {['v1', 'v2', 'v3', 'v4'].map((v, i) => {
+                              const pData = product.prices[v];
+                              const dealerBoxPriceStr = getDiscountedPrice(pData.dealerBox ?? pData.dealer ?? 0, product.categoryId);
+                              const packQtyNum = parseFloat(product.packQty) || 0;
+                              const boxTotalFormatted = (parseFloat(dealerBoxPriceStr) * packQtyNum).toLocaleString('en-US', {minimumFractionDigits: 2});
+                              
+                              return (
+                                <td key={v} className={`p-2 border-r border-gray-200 align-middle ${i%2===0 ? 'bg-slate-50/50' : 'bg-white'}`}>
+                                  <div className="flex flex-col justify-between items-center h-full space-y-1.5 print:space-y-2.5 py-1.5">
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-gray-500 uppercase font-semibold print:text-[7px] block mb-0.5">Dealer (ครบลัง)</span>
+                                      <span className="font-black text-slate-900 text-[13px] print:text-[11px]">
+                                        ฿{dealerBoxPriceStr}
+                                        {packQtyNum > 0 && <span className="text-[10px] text-slate-600 font-medium ml-1 print:text-[9px]">({boxTotalFormatted})</span>}
+                                      </span>
+                                    </div>
+                                    <div className="w-[90%] border-b border-dotted border-gray-300"></div>
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-gray-500 uppercase font-semibold print:text-[7px] block mb-0.5">Dealer (ไม่ครบลัง)</span>
+                                      <span className="font-bold text-slate-700 text-[12px] print:text-[10px]">฿{parseFloat(pData.dealerUnbox ?? pData.dealer ?? 0).toFixed(2)}</span>
+                                    </div>
+                                    <div className="w-[90%] border-b border-dotted border-gray-300"></div>
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-emerald-700 uppercase font-bold print:text-[7px] block mb-0.5">Selling Price (แนะนำขาย)</span>
+                                      <span className="font-bold text-emerald-700 text-[11px] print:text-[9px]">฿{parseFloat(pData.sellingPrice ?? pData.retail ?? 0).toFixed(2)}</span>
+                                    </div>
+                                    <div className="w-[90%] border-b border-dotted border-gray-300"></div>
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-slate-500 uppercase print:text-[7px] font-medium block mb-0.5">List Price (ราคาตั้ง)</span>
+                                      <span className="font-semibold text-slate-600 text-[11px] print:text-[9px]">฿{parseFloat(pData.retail ?? 0).toFixed(2)}</span>
+                                    </div>
+                                  </div>
+                                </td>
+                              );
+                            })}
+                            {(currentUser.permissions.products.edit || currentUser.permissions.products.remove) && (
+                                <td className="p-2 text-center print:hidden border-r-0 align-middle">
+                                  <div className="flex flex-col items-center gap-1.5 opacity-30 group-hover:opacity-100 transition-opacity">
+                                    {currentUser.permissions.products.edit && (
+                                        <div className="flex gap-1">
+                                          <button 
+                                            onClick={() => moveProductUp(absoluteIndex)} 
+                                            disabled={absoluteIndex <= 0} 
+                                            className="p-1 bg-gray-200 text-gray-600 rounded hover:bg-blue-100 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed" 
+                                            title="Move Up"
+                                          >
+                                            <i className="fas fa-chevron-up text-[12px] w-4"></i>
+                                          </button>
+                                          <button 
+                                            onClick={() => moveProductDown(absoluteIndex)} 
+                                            disabled={absoluteIndex >= products.length - 1} 
+                                            className="p-1 bg-gray-200 text-gray-600 rounded hover:bg-blue-100 hover:text-blue-600 disabled:opacity-30 disabled:cursor-not-allowed" 
+                                            title="Move Down"
+                                          >
+                                            <i className="fas fa-chevron-down text-[12px] w-4"></i>
+                                          </button>
+                                        </div>
+                                    )}
+                                    {currentUser.permissions.products.remove && (
+                                        <button 
+                                          onClick={() => setProductToDelete(product.id)} 
+                                          className="text-red-400 hover:text-red-600 transition-colors p-1 rounded hover:bg-red-50 w-full" 
+                                          title="Remove Product"
+                                        >
+                                          <i className="fas fa-trash text-[14px]"></i>
+                                        </button>
+                                    )}
+                                  </div>
+                                </td>
+                            )}
+                          </tr>
+                        )})}
+                      </tbody>
+                    </table>
+                  </div>
+                  <PrintFooterSignature />
+                </div>
+              )}
+
+              {/* TAB 1.5: SIMPLE PRICELIST (Read-Only) */}
+              {activeTab === 'simplePricelist' && (
+                <div className="animate-in fade-in duration-300">
+                  <PrintHeader title="VG PRODUCT PRICELIST (SP)" subtitle="(ใบแจ้งราคา)" />
+                  
+                  {renderProductCategoryFilter()}
+
+                  <div className="overflow-x-auto print:overflow-visible">
+                    <table className="w-full text-left border-collapse min-w-[900px] print:min-w-0">
+                      <thead>
+                        {/* Luxury Dark Header - Reverted Text Size */}
+                        <tr className="bg-slate-900 text-white text-sm print:text-[11px] uppercase tracking-wider align-middle text-center">
+                          <th className="p-3 font-bold text-center align-middle border-r border-slate-800 print:w-[28%]">
+                            Products
+                            <span className="block text-[10px] font-normal text-gray-300 print:text-[9px] mt-0.5">(รายการสินค้า)</span>
+                          </th>
+                          <th className="p-3 font-bold text-center align-middle w-20 border-r border-slate-800 print:w-[12%]">
+                            Pack Size
+                            <span className="block text-[10px] font-normal text-gray-300 print:text-[9px] mt-0.5">(ขนาดแพ็ค)</span>
+                          </th>
+                          {['v1', 'v2', 'v3', 'v4'].map((v, i) => (
+                            <th key={v} className={`p-2 font-bold text-center align-middle border-r border-slate-800 ${i%2===0 ? 'bg-slate-800' : 'bg-slate-900'}`}>
+                              <span className="text-center font-bold w-full block print:hidden">{headers[v]}</span>
+                              <div className="hidden print:flex flex-col items-center justify-center w-full">
+                                <span className="tracking-wide text-sm print:text-[11px]">{headers[v].split(' (')[0]}</span>
+                                {headers[v].includes(' (') && <span className="block text-[10px] font-normal text-gray-300 print:text-[9px] mt-0.5">({headers[v].split(' (')[1]}</span>}
+                              </div>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200">
+                        {filteredProducts.map((product) => (
+                          <tr key={product.id} className="bg-white">
+                            <td className="p-3 border-r border-gray-200 align-middle">
+                              <p className="font-extrabold text-slate-900 leading-snug print:text-[12px]">{product.name}</p>
+                              <img src={product.image} alt="" className="w-24 h-24 print:w-16 print:h-16 object-contain rounded border border-gray-200 my-2 print:mx-auto" />
+                              <p className="mt-1 text-[11px] text-slate-700 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 inline-block print:hidden">
+                                {categories.find(c => c.id === product.categoryId)?.name} ({categories.find(c => c.id === product.categoryId)?.discount}%)
+                              </p>
+                            </td>
+                            {/* Pack Size +25% */}
+                            <td className="p-2 text-center border-r border-gray-200 align-middle">
+                              <p className="font-bold text-[15px] text-slate-800 print:text-[13px]">{product.packQty}</p>
+                              <p className="text-[11px] text-slate-500 font-medium print:text-[10px]">{product.unit}</p>
+                            </td>
+                            {/* Prices +10% */}
+                            {['v1', 'v2', 'v3', 'v4'].map((v, i) => {
+                              const pData = product.prices[v];
+                              const dealerBoxPriceStr = getDiscountedPrice(pData.dealerBox ?? pData.dealer ?? 0, product.categoryId);
+                              const packQtyNum = parseFloat(product.packQty) || 0;
+                              const boxTotalFormatted = (parseFloat(dealerBoxPriceStr) * packQtyNum).toLocaleString('en-US', {minimumFractionDigits: 2});
+                              
+                              return (
+                                <td key={v} className={`p-2 border-r border-gray-200 align-middle ${i%2===0 ? 'bg-slate-50/50' : 'bg-white'}`}>
+                                  <div className="flex flex-col justify-between items-center h-full space-y-1.5 print:space-y-2.5 py-1.5">
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-gray-500 uppercase font-semibold print:text-[7px] block mb-0.5">Dealer (ครบลัง)</span>
+                                      <span className="font-black text-slate-900 text-[13px] print:text-[11px]">
+                                        ฿{dealerBoxPriceStr}
+                                        {packQtyNum > 0 && <span className="text-[10px] text-slate-600 font-medium ml-1 print:text-[9px]">({boxTotalFormatted})</span>}
+                                      </span>
+                                    </div>
+                                    <div className="w-[90%] border-b border-dotted border-gray-300"></div>
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-gray-500 uppercase font-semibold print:text-[7px] block mb-0.5">Dealer (ไม่ครบลัง)</span>
+                                      <span className="font-bold text-slate-700 text-[12px] print:text-[10px]">฿{parseFloat(pData.dealerUnbox ?? pData.dealer ?? 0).toFixed(2)}</span>
+                                    </div>
+                                    <div className="w-[90%] border-b border-dotted border-gray-300"></div>
+                                    <div className="text-center w-full">
+                                      <span className="text-[9px] text-emerald-700 uppercase font-bold print:text-[7px] block mb-0.5">Retail (ราคาปลีก)</span>
+                                      {/* Displays SellingPrice data but labelled as Retail */}
+                                      <span className="font-bold text-emerald-700 text-[11px] print:text-[9px]">฿{parseFloat(pData.sellingPrice ?? pData.retail ?? 0).toFixed(2)}</span>
+                                    </div>
+                                  </div>
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <PrintFooterSignature />
+                </div>
+              )}
+
+              {/* TAB 3: DATABASES MANAGEMENT */}
+              {activeTab === 'databases' && (
+                <div className="animate-in fade-in duration-300 space-y-6">
+                  <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center border-b-2 border-slate-900 pb-3 gap-4">
+                    <div>
+                        <h2 className="text-2xl font-black text-slate-900 uppercase tracking-widest"><i className="fas fa-database text-blue-600 mr-2"></i> Database Management</h2>
+                        <span className="text-sm text-gray-500 font-medium block mt-1">Manage App Data, Users & Settings</span>
+                    </div>
+                  </div>
+
+                  {/* SUB-NAVIGATION TABS */}
+                  <div className="flex flex-wrap gap-2 border-b border-gray-200 pb-4">
+                    {currentUser.permissions.company.view && (
+                      <button onClick={() => setDbTab('entities')} className={`px-4 py-2 text-sm font-bold rounded-lg transition-all ${dbTab === 'entities' ? 'bg-slate-800 text-white shadow-md' : 'bg-white text-gray-600 hover:bg-slate-50 border border-gray-200'}`}>
+                        <i className="fas fa-building mr-1.5 text-blue-400"></i> Company Info
+                      </button>
+                    )}
+                    {currentUser.permissions.users.view && (
+                      <button onClick={() => setDbTab('users')} className={`px-4 py-2 text-sm font-bold rounded-lg transition-all ${dbTab === 'users' ? 'bg-slate-800 text-white shadow-md' : 'bg-white text-gray-600 hover:bg-slate-50 border border-gray-200'}`}>
+                        <i className="fas fa-users mr-1.5 text-blue-400"></i> User Management
+                      </button>
+                    )}
+                    {currentUser.permissions.masterData.view && (
+                      <button onClick={() => setDbTab('config')} className={`px-4 py-2 text-sm font-bold rounded-lg transition-all ${dbTab === 'config' ? 'bg-slate-800 text-white shadow-md' : 'bg-white text-gray-600 hover:bg-slate-50 border border-gray-200'}`}>
+                        <i className="fas fa-cogs mr-1.5 text-blue-400"></i> System Config
+                      </button>
+                    )}
+                    {currentUser.permissions.actions.canImportExport && (
+                      <button onClick={() => setDbTab('data')} className={`px-4 py-2 text-sm font-bold rounded-lg transition-all ${dbTab === 'data' ? 'bg-slate-800 text-white shadow-md' : 'bg-white text-gray-600 hover:bg-slate-50 border border-gray-200'}`}>
+                        <i className="fas fa-file-excel mr-1.5 text-emerald-500"></i> Data Import/Export
+                      </button>
+                    )}
+                    {currentUser.role === 'admin' && (
+                      <button onClick={() => setDbTab('logs')} className={`px-4 py-2 text-sm font-bold rounded-lg transition-all ${dbTab === 'logs' ? 'bg-slate-800 text-white shadow-md' : 'bg-white text-gray-600 hover:bg-slate-50 border border-gray-200'}`}>
+                        <i className="fas fa-shield-alt mr-1.5 text-red-400"></i> Audit Logs
+                      </button>
+                    )}
+                  </div>
+
+                  {/* --- SUB-TAB: DATA IMPORT / EXPORT --- */}
+                  {dbTab === 'data' && currentUser.permissions.actions.canImportExport && (
+                      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-6 shadow-sm animate-in fade-in slide-in-from-bottom-2">
+                         <h3 className="text-lg font-bold text-emerald-900 flex items-center gap-2 border-b border-emerald-200 pb-2 mb-4">
+                           <i className="fas fa-file-excel text-emerald-600"></i> Excel Data Management
+                         </h3>
+                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                            
+                            {/* Products Excel */}
+                            <div className="bg-white p-4 rounded-lg border border-emerald-100 shadow-sm flex flex-col gap-3">
+                               <h4 className="font-bold text-emerald-800 text-sm">Products</h4>
+                               <button onClick={() => handleExcelExport('products')} className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded shadow-sm transition-colors flex justify-center items-center gap-2">
+                                  <i className="fas fa-download"></i> Export (.xlsx)
+                               </button>
+                               <div className="relative">
+                                  <input type="file" accept=".xlsx, .xls" onChange={(e) => handleExcelImport(e, 'products')} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                                  <button className="w-full py-2 bg-white border border-emerald-300 text-emerald-700 hover:bg-emerald-50 text-xs font-bold rounded shadow-sm transition-colors flex justify-center items-center gap-2">
+                                      <i className="fas fa-upload"></i> Import (.xlsx)
+                                  </button>
+                               </div>
+                            </div>
+
+                            {/* Users Excel */}
+                            <div className="bg-white p-4 rounded-lg border border-emerald-100 shadow-sm flex flex-col gap-3">
+                               <h4 className="font-bold text-emerald-800 text-sm">Users</h4>
+                               <button onClick={() => handleExcelExport('users')} className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded shadow-sm transition-colors flex justify-center items-center gap-2">
+                                  <i className="fas fa-download"></i> Export (.xlsx)
+                               </button>
+                               <div className="relative">
+                                  <input type="file" accept=".xlsx, .xls" onChange={(e) => handleExcelImport(e, 'users')} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                                  <button className="w-full py-2 bg-white border border-emerald-300 text-emerald-700 hover:bg-emerald-50 text-xs font-bold rounded shadow-sm transition-colors flex justify-center items-center gap-2">
+                                      <i className="fas fa-upload"></i> Import (.xlsx)
+                                  </button>
+                               </div>
+                            </div>
+
+                            {/* Categories Excel */}
+                            <div className="bg-white p-4 rounded-lg border border-emerald-100 shadow-sm flex flex-col gap-3">
+                               <h4 className="font-bold text-emerald-800 text-sm">Categories</h4>
+                               <button onClick={() => handleExcelExport('categories')} className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded shadow-sm transition-colors flex justify-center items-center gap-2">
+                                  <i className="fas fa-download"></i> Export (.xlsx)
+                               </button>
+                               <div className="relative">
+                                  <input type="file" accept=".xlsx, .xls" onChange={(e) => handleExcelImport(e, 'categories')} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                                  <button className="w-full py-2 bg-white border border-emerald-300 text-emerald-700 hover:bg-emerald-50 text-xs font-bold rounded shadow-sm transition-colors flex justify-center items-center gap-2">
+                                      <i className="fas fa-upload"></i> Import (.xlsx)
+                                  </button>
+                               </div>
+                            </div>
+                         </div>
+                      </div>
+                  )}
+
+                  {/* --- SUB-TAB: COMPANY INFO --- */}
+                  {dbTab === 'entities' && (
+                    <div className="max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-2">
+                      {/* COMPANY DATABASE */}
+                      {currentUser.permissions.company.view && (
+                          <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm flex flex-col gap-6">
+                            <h3 className="text-lg font-bold text-blue-900 flex items-center gap-2 border-b pb-2">
+                              <i className="fas fa-building text-blue-500"></i> Manage Company Infos
+                            </h3>
+                            
+                            {(currentUser.permissions.company.add || currentUser.permissions.company.edit) && (
+                                <form onSubmit={handleSaveCompDB} className="bg-slate-50 p-4 rounded-lg border border-slate-200 space-y-3 shadow-inner">
+                                  <h4 className="text-sm font-bold text-slate-700 mb-2">{isEditingComp ? 'Edit Company Profile' : 'Add New Company'}</h4>
+                                  <input required type="text" placeholder="Company Name" value={compForm.name} onChange={e => setCompForm({...compForm, name: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                                  <textarea required placeholder="Address & Tax ID" value={compForm.address} onChange={e => setCompForm({...compForm, address: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 h-20 resize-none bg-white" />
+                                  <input required type="text" placeholder="Contact Info (Phone, Email)" value={compForm.contact} onChange={e => setCompForm({...compForm, contact: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                                  
+                                  <div className="flex items-center gap-3">
+                                     {compForm.logo && <img src={compForm.logo} alt="Preview" className="w-12 h-12 object-contain border rounded bg-white shadow-sm" />}
+                                     <label className="flex-1 cursor-pointer bg-white hover:bg-gray-50 border border-gray-300 text-gray-700 text-xs font-bold py-2 px-3 rounded text-center transition-colors">
+                                        <i className="fas fa-upload text-blue-500 mr-1"></i> {compForm.logo ? 'Change Logo' : 'Upload Logo'}
+                                        <input type="file" accept="image/*" onChange={handleDbLogoUpload} className="hidden" />
+                                     </label>
+                                  </div>
+                                  
+                                  <div className="flex gap-2 pt-2">
+                                     <button type="submit" className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2 rounded transition-colors shadow-sm">
+                                       {isEditingComp ? 'Update Company' : 'Add Company'}
+                                     </button>
+                                     {isEditingComp && (
+                                       <button type="button" onClick={() => { setIsEditingComp(false); setCompForm({id:'', name:'', address:'', contact:'', logo:''}); }} className="px-4 bg-gray-200 hover:bg-gray-300 text-gray-700 text-sm font-bold rounded transition-colors">Cancel</button>
+                                     )}
+                                  </div>
+                                </form>
+                            )}
+
+                            <div className="flex-1 overflow-y-auto max-h-[400px] pr-2 space-y-3">
+                               {savedCompanies.map(c => (
+                                 <div key={c.id} className="bg-white border border-gray-200 rounded-lg p-3 flex justify-between items-center shadow-sm hover:border-blue-300 transition-colors">
+                                   <div className="flex items-center gap-3 overflow-hidden">
+                                      {c.logo ? <img src={c.logo} alt="logo" className="w-10 h-10 object-contain flex-shrink-0" /> : <div className="w-10 h-10 bg-gray-100 flex items-center justify-center text-gray-300 rounded flex-shrink-0"><i className="fas fa-building"></i></div>}
+                                      <div className="overflow-hidden">
+                                         <p className="font-bold text-sm text-slate-800 truncate">{c.name}</p>
+                                         <p className="text-[10px] text-gray-500 truncate">{c.contact}</p>
+                                      </div>
+                                   </div>
+                                   <div className="flex gap-2 flex-shrink-0 ml-2">
+                                      {currentUser.permissions.company.edit && <button onClick={() => handleEditComp(c)} className="w-8 h-8 rounded bg-yellow-50 text-yellow-600 hover:bg-yellow-100 transition-colors flex items-center justify-center" title="Edit"><i className="fas fa-pen text-xs"></i></button>}
+                                      {currentUser.permissions.company.remove && <button onClick={() => handleDeleteComp(c.id)} className="w-8 h-8 rounded bg-red-50 text-red-600 hover:bg-red-100 transition-colors flex items-center justify-center" title="Delete"><i className="fas fa-trash text-xs"></i></button>}
+                                   </div>
+                                 </div>
+                               ))}
+                               {savedCompanies.length === 0 && <p className="text-center text-gray-400 text-sm py-8 italic">No companies saved yet.</p>}
+                            </div>
+                          </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* --- SUB-TAB: USER MANAGEMENT --- */}
+                  {dbTab === 'users' && currentUser.permissions.users.view && (
+                      <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm flex flex-col gap-6 max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-2">
+                        <h3 className="text-lg font-bold text-blue-900 flex items-center gap-2 border-b pb-2">
+                          <i className="fas fa-users text-blue-500"></i> Manage Users
+                        </h3>
+                        
+                        {(currentUser.permissions.users.add || currentUser.permissions.users.edit) && (
+                            <form onSubmit={handleSaveSpDB} className="bg-slate-50 p-4 rounded-lg border border-slate-200 space-y-3 shadow-inner">
+                              <h4 className="text-sm font-bold text-slate-700 mb-2">{isEditingSp ? 'Edit User Profile' : 'Add New User'}</h4>
+                              <div className="grid grid-cols-2 gap-4">
+                                  <div>
+                                      <label className="block text-[10px] font-bold text-gray-600 mb-1">Full Name</label>
+                                      <input required type="text" placeholder="John Doe" value={spForm.name} onChange={e => setSpForm({...spForm, name: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                                  </div>
+                                  <div>
+                                      <label className="block text-[10px] font-bold text-gray-600 mb-1">Phone Number</label>
+                                      <input required type="text" placeholder="08x-xxx-xxxx" value={spForm.phone} onChange={e => setSpForm({...spForm, phone: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                                  </div>
+                              </div>
+                              
+                              <div className="grid grid-cols-2 gap-4">
+                                  <div>
+                                      <label className="block text-[10px] font-bold text-gray-600 mb-1">Login ID</label>
+                                      <input required type="text" placeholder="admin / email@company.com" value={spForm.email} onChange={e => setSpForm({...spForm, email: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                                  </div>
+                                  {(!isEditingSp || currentUser.role === 'admin') && (
+                                      <div>
+                                          <label className="block text-[10px] font-bold text-gray-600 mb-1">Password</label>
+                                          <input required={!isEditingSp} type="text" placeholder="Password" value={spForm.password} onChange={e => setSpForm({...spForm, password: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                                      </div>
+                                  )}
+                              </div>
+
+                              <div>
+                                  <label className="block text-[10px] font-bold text-gray-600 mb-1">Access Role</label>
+                                  <select value={spForm.role} onChange={handleRoleChangeForSpForm} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white cursor-pointer font-bold text-blue-900">
+                                      {currentUser.role === 'admin' && <option value="admin">Admin (Full Access)</option>}
+                                      <option value="manager">Manager</option>
+                                      <option value="regional">Regional</option>
+                                      <option value="supervisor">Supervisor</option>
+                                      <option value="backOffice">Back Office User</option>
+                                      <option value="salesAdmin">Sales Admin</option>
+                                      <option value="salesperson">Salesperson</option>
+                                  </select>
+                              </div>
+
+                              <div className="pt-4 border-t border-gray-200 mt-4">
+                                  <label className="block text-sm font-bold text-gray-800 mb-3"><i className="fas fa-shield-alt text-blue-500 mr-1"></i> Specific Permissions (Override)</label>
+                                  
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4">
+                                    {renderCrudCheckboxes("Products Database", "products")}
+                                    {renderCrudCheckboxes("Users Management", "users")}
+                                    {renderCrudCheckboxes("Company Info", "company")}
+                                    {renderCrudCheckboxes("Base Discounts", "discounts")}
+                                    {renderCrudCheckboxes("Master Data", "masterData")}
+
+                                    <div className="flex flex-col gap-1.5 border-b border-gray-200 pb-2 mb-2">
+                                        <span className="text-[11px] font-bold text-gray-800">Tabs & System</span>
+                                        <div className="grid grid-cols-2 gap-x-2 gap-y-3 mt-1">
+                                            {renderSystemCheckbox("Use LP Pricelist", "tabs", "lpPricelist")}
+                                            {renderSystemCheckbox("Use Simple Pricelist", "tabs", "simplePricelist")}
+                                            {renderSystemCheckbox("Save Settings", "actions", "canSave", true)}
+                                            {renderSystemCheckbox("Print PDF", "actions", "canPrint", true)}
+                                            {renderSystemCheckbox("Import/Export DB", "actions", "canImportExport", true)}
+                                        </div>
+                                    </div>
+                                  </div>
+                              </div>
+                              
+                              <div className="flex gap-2 pt-4">
+                                 <button type="submit" className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2.5 rounded transition-colors shadow-sm">
+                                   {isEditingSp ? 'Update User' : 'Create User'}
+                                 </button>
+                                 {isEditingSp && (
+                                   <button type="button" onClick={() => { setIsEditingSp(false); setSpForm({id:'', name:'', phone:'', email: '', password: '', role: 'salesperson', permissions: {...rolePermissions.salesperson}}); }} className="px-6 bg-gray-200 hover:bg-gray-300 text-gray-700 text-sm font-bold rounded transition-colors">Cancel</button>
+                                 )}
+                              </div>
+                            </form>
+                        )}
+
+                        <div className="flex-1 overflow-y-auto max-h-[500px] pr-2 space-y-3 mt-4">
+                           {savedSalespersons.map(s => (
+                             <div key={s.id} className="bg-white border border-gray-200 rounded-lg p-4 flex justify-between items-center shadow-sm hover:border-blue-300 transition-colors">
+                               <div className="flex items-center gap-4 overflow-hidden">
+                                  <div className="w-12 h-12 bg-blue-100 flex items-center justify-center text-blue-500 rounded-full flex-shrink-0 font-bold text-lg">
+                                    {s.name.charAt(0).toUpperCase()}
+                                  </div>
+                                  <div className="overflow-hidden">
+                                     <p className="font-bold text-base text-slate-800 truncate">{s.name} <span className="text-[9px] uppercase bg-gray-200 text-gray-600 px-1.5 py-0.5 rounded ml-1.5 align-middle">{s.role}</span></p>
+                                     <p className="text-xs text-gray-500 truncate mt-0.5">ID: {s.email} {currentUser.role === 'admin' && <span className="text-red-500 ml-1.5 font-medium">| Pass: {s.password}</span>}</p>
+                                  </div>
+                               </div>
+                               <div className="flex gap-2 flex-shrink-0 ml-2">
+                                  {currentUser.permissions.users.edit && <button onClick={() => handleEditSp(s)} className="w-9 h-9 rounded bg-yellow-50 text-yellow-600 hover:bg-yellow-100 transition-colors flex items-center justify-center" title="Edit"><i className="fas fa-pen text-sm"></i></button>}
+                                  {currentUser.permissions.users.remove && <button onClick={() => handleDeleteSp(s.id)} className="w-9 h-9 rounded bg-red-50 text-red-600 hover:bg-red-100 transition-colors flex items-center justify-center" title="Delete"><i className="fas fa-trash text-sm"></i></button>}
+                               </div>
+                             </div>
+                           ))}
+                        </div>
+                      </div>
+                  )}
+                  
+                  {/* --- SUB-TAB: SYSTEM CONFIG (Product Categories Only) --- */}
+                  {dbTab === 'config' && currentUser.permissions.masterData.view && (
+                    <div className="flex flex-col gap-8 animate-in fade-in slide-in-from-bottom-2 max-w-4xl mx-auto">
+                      {/* PRODUCT CATEGORIES */}
+                      <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm flex flex-col gap-6">
+                        <h3 className="text-lg font-bold text-blue-900 flex items-center gap-2 border-b pb-2">
+                          <i className="fas fa-tags text-blue-500"></i> Manage Product Categories
+                        </h3>
+                        
+                        {(currentUser.permissions.masterData.add || currentUser.permissions.masterData.edit) && (
+                            <form onSubmit={handleSavePcDB} className="bg-slate-50 p-4 rounded-lg border border-slate-200 space-y-3 shadow-inner">
+                              <h4 className="text-sm font-bold text-slate-700 mb-2">{isEditingPc ? 'Edit Category' : 'Add New Category'}</h4>
+                              <input required type="text" placeholder="Category Name (e.g. Gutters)" value={pcForm.name} onChange={e => setPcForm({...pcForm, name: e.target.value})} className="w-full text-sm p-2 border border-gray-300 rounded outline-none focus:border-blue-500 bg-white" />
+                              
+                              <div className="flex gap-2 pt-2">
+                                 <button type="submit" className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2 rounded transition-colors shadow-sm">
+                                   {isEditingPc ? 'Update Category' : 'Add Category'}
+                                 </button>
+                                 {isEditingPc && (
+                                   <button type="button" onClick={() => { setIsEditingPc(false); setPcForm({id:'', name:''}); }} className="px-4 bg-gray-200 hover:bg-gray-300 text-gray-700 text-sm font-bold rounded transition-colors">Cancel</button>
+                                 )}
+                              </div>
+                            </form>
+                        )}
+
+                        <div className="flex-1 overflow-y-auto max-h-[500px] pr-2 space-y-3">
+                           {productCategories.map(c => (
+                             <div key={c.id} className="bg-white border border-gray-200 rounded-lg p-3 flex justify-between items-center shadow-sm hover:border-blue-300 transition-colors">
+                               <div className="flex items-center gap-3 overflow-hidden">
+                                  <div className="w-8 h-8 bg-blue-100 flex items-center justify-center text-blue-500 rounded flex-shrink-0"><i className="fas fa-tag"></i></div>
+                                  <p className="font-bold text-sm text-slate-800 truncate">{c.name}</p>
+                               </div>
+                               <div className="flex gap-2 flex-shrink-0 ml-2">
+                                  {currentUser.permissions.masterData.edit && <button onClick={() => handleEditPc(c)} className="w-8 h-8 rounded bg-yellow-50 text-yellow-600 hover:bg-yellow-100 transition-colors flex items-center justify-center" title="Edit"><i className="fas fa-pen text-xs"></i></button>}
+                                  {currentUser.permissions.masterData.remove && <button onClick={() => handleDeletePc(c.id)} className="w-8 h-8 rounded bg-red-50 text-red-600 hover:bg-red-100 transition-colors flex items-center justify-center" title="Delete"><i className="fas fa-trash text-xs"></i></button>}
+                               </div>
+                             </div>
+                           ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* --- SUB-TAB: AUDIT LOGS --- */}
+                  {dbTab === 'logs' && currentUser.role === 'admin' && (
+                      <div className="bg-slate-900 p-6 rounded-xl border border-slate-800 shadow-lg flex flex-col gap-6 animate-in fade-in slide-in-from-bottom-2">
+                        <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center border-b border-slate-700 pb-3 gap-4">
+                          <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                            <i className="fas fa-shield-alt text-emerald-400"></i> System Audit Logs
+                          </h3>
+                          
+                          <form onSubmit={handleLogExport} className="flex flex-wrap gap-2 items-center bg-slate-800 p-1.5 rounded-lg border border-slate-600">
+                              <select value={exportLogType} onChange={e=>setExportLogType(e.target.value)} className="bg-slate-700 text-white text-xs p-1.5 rounded border border-slate-600 outline-none">
+                                  <option value="login">Login Logs</option>
+                                  <option value="activity">Activity Logs</option>
+                              </select>
+                              <div className="flex items-center gap-1.5">
+                                <input type="date" value={exportStartDate} onChange={e=>setExportStartDate(e.target.value)} className="bg-slate-700 text-white text-xs p-1 rounded border border-slate-600 outline-none" />
+                                <span className="text-slate-400 text-xs">to</span>
+                                <input type="date" value={exportEndDate} onChange={e=>setExportEndDate(e.target.value)} className="bg-slate-700 text-white text-xs p-1 rounded border border-slate-600 outline-none" />
+                              </div>
+                              <button type="submit" className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1.5 rounded transition-colors shadow-sm ml-auto">Export</button>
+                          </form>
+                        </div>
+                        
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            {/* Login Logs */}
+                            <div className="flex flex-col gap-2">
+                                <h4 className="text-emerald-400 text-xs font-bold uppercase tracking-widest mb-1 flex justify-between">
+                                    Login History <span className="text-slate-500 font-normal normal-case">(Retained 6 months)</span>
+                                </h4>
+                                <div className="overflow-y-auto max-h-[500px] border border-slate-700 rounded">
+                                   <table className="w-full text-left text-sm text-slate-300">
+                                      <thead className="bg-slate-800 sticky top-0">
+                                         <tr className="text-slate-400 text-[10px] uppercase">
+                                            <th className="p-3 font-semibold">Date & Time</th>
+                                            <th className="p-3 font-semibold">User</th>
+                                            <th className="p-3 font-semibold text-center">Location</th>
+                                         </tr>
+                                      </thead>
+                                      <tbody>
+                                         {loginLogs.length === 0 ? (
+                                            <tr><td colSpan="3" className="py-6 text-center text-slate-500 italic">No login records found.</td></tr>
+                                         ) : (
+                                            loginLogs.slice(0,100).map(log => (
+                                               <tr key={log.id} className="border-b border-slate-800 hover:bg-slate-800/50">
+                                                  <td className="p-3 font-mono text-[10px]">{new Date(log.timestamp).toLocaleString()}</td>
+                                                  <td className="p-3 font-bold text-white text-[11px]">{log.userName}</td>
+                                                  <td className="p-3 text-center">
+                                                      {log.lat !== null && log.lng !== null ? (
+                                                          <a href={`https://www.google.com/maps?q=${log.lat},${log.lng}`} target="_blank" rel="noreferrer" className="text-emerald-400 hover:text-emerald-300 transition-colors text-[10px]" title="View on Map">
+                                                              <i className="fas fa-map-marker-alt"></i> Map
+                                                          </a>
+                                                      ) : (
+                                                          <span className="text-slate-500 italic text-[9px] bg-slate-800 px-1.5 py-0.5 rounded">Bypass</span>
+                                                      )}
+                                                  </td>
+                                               </tr>
+                                            ))
+                                         )}
+                                      </tbody>
+                                   </table>
+                                </div>
+                            </div>
+
+                            {/* Activity Logs */}
+                            <div className="flex flex-col gap-2">
+                                <h4 className="text-blue-400 text-xs font-bold uppercase tracking-widest mb-1 flex justify-between">
+                                    Activity History <span className="text-slate-500 font-normal normal-case">(Retained 12 months)</span>
+                                </h4>
+                                <div className="overflow-y-auto max-h-[500px] border border-slate-700 rounded">
+                                   <table className="w-full text-left text-sm text-slate-300">
+                                      <thead className="bg-slate-800 sticky top-0">
+                                         <tr className="text-slate-400 text-[10px] uppercase">
+                                            <th className="p-3 font-semibold">Date & Time</th>
+                                            <th className="p-3 font-semibold">User</th>
+                                            <th className="p-3 font-semibold">Action</th>
+                                         </tr>
+                                      </thead>
+                                      <tbody>
+                                         {activityLogs.length === 0 ? (
+                                            <tr><td colSpan="3" className="py-6 text-center text-slate-500 italic">No activity records found.</td></tr>
+                                         ) : (
+                                            activityLogs.slice(0,100).map(log => (
+                                               <tr key={log.id} className="border-b border-slate-800 hover:bg-slate-800/50">
+                                                  <td className="p-3 font-mono text-[10px]">{new Date(log.timestamp).toLocaleString()}</td>
+                                                  <td className="p-3 font-bold text-white text-[11px]">{log.userName}</td>
+                                                  <td className="p-3 text-[10px] text-blue-300" title={log.details}>{log.action}</td>
+                                               </tr>
+                                            ))
+                                         )}
+                                      </tbody>
+                                   </table>
+                                </div>
+                            </div>
+                        </div>
+                      </div>
+                  )}
+
+                </div>
+              )}
+            </section>
+          </main>
+
+          {/* --- WIZARD OVERLAYS --- */}
+          
+          {/* EXCEL MERGE WIZARD */}
+          {mergeWizard.isOpen && (
+            <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-sm flex items-center justify-center z-[100] p-4 print:hidden">
+               <div className="bg-white rounded-xl shadow-2xl w-full max-w-[1200px] max-h-[90vh] flex flex-col animate-in zoom-in-95">
+                  <div className="p-5 border-b border-gray-200 flex justify-between items-center bg-white rounded-t-xl">
+                     <h3 className="text-xl font-black text-slate-900 flex items-center gap-2">
+                         <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600"><i className="fas fa-table"></i></div>
+                         Resolve Import Conflicts ({mergeWizard.currentIndex + 1} of {mergeWizard.queue.length})
+                     </h3>
+                     <button onClick={() => {
+                         if(window.confirm("Cancel import? No changes will be saved.")) setMergeWizard({isOpen: false, type: '', queue: [], currentIndex: 0, newItems: [], resolvedItems: [], extraUpdates: {}});
+                     }} className="text-gray-400 hover:text-red-500 transition-colors"><i className="fas fa-times text-2xl"></i></button>
+                  </div>
+                  
+                  <div className="p-6 overflow-y-auto flex-1 bg-slate-50 flex flex-col gap-6">
+                      <div className="bg-blue-50 border border-blue-200 p-4 rounded-lg text-sm text-blue-800 shadow-sm flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                          <span className="flex-1"><i className="fas fa-info-circle mr-1"></i> A record with this ID/Name already exists. Review the differences below and edit the <strong>Final Merged Data</strong> column directly (like an Excel sheet) to resolve the conflict.</span>
+                          <div className="flex gap-2 flex-shrink-0">
+                              <button onClick={() => handleWizardAction('use_existing')} className="px-4 py-2 bg-red-100 text-red-700 font-bold text-xs rounded hover:bg-red-200 transition-colors shadow-sm border border-red-200"><i className="fas fa-arrow-left mr-1"></i> Keep Existing</button>
+                              <button onClick={() => handleWizardAction('use_imported')} className="px-4 py-2 bg-emerald-100 text-emerald-700 font-bold text-xs rounded hover:bg-emerald-200 transition-colors shadow-sm border border-emerald-200"><i className="fas fa-arrow-left mr-1"></i> Use Imported</button>
+                          </div>
+                      </div>
+                      
+                      <div className="overflow-x-auto w-full border border-gray-200 rounded-lg shadow-sm bg-white">
+                         <table className="w-full text-left text-sm whitespace-nowrap">
+                           <thead className="bg-slate-800 text-white">
+                              <tr>
+                                <th className="p-3 font-bold w-1/4">Field Name</th>
+                                <th className="p-3 font-bold w-1/4 bg-red-900/50">Existing Data (In App)</th>
+                                <th className="p-3 font-bold w-1/4 bg-emerald-900/50">Imported Data (Excel)</th>
+                                <th className="p-3 font-bold w-1/4 bg-blue-900/50">Final Merged Data (Edit)</th>
+                              </tr>
+                           </thead>
+                           <tbody className="divide-y divide-gray-200">
+                             {Object.keys(wizardDraftFlat).map(key => {
+                                if (key === 'permissions' || typeof wizardDraftFlat[key] === 'object') return null;
+      
+                                const isId = key === 'id';
+                                const originalType = typeof wizardExistingFlat[key];
+                                const inputType = originalType === 'number' ? 'number' : 'text';
+                                
+                                const isDiff = String(wizardExistingFlat[key]) !== String(wizardImportedFlat[key]);
+      
+                                return (
+                                  <tr key={key} className={`hover:bg-blue-50/50 ${isDiff ? 'bg-yellow-50/30' : 'bg-white'}`}>
+                                    <td className="p-3 font-bold text-slate-700 border-r border-gray-100">
+                                      {key} {isDiff && <span className="ml-2 text-[9px] bg-yellow-200 text-yellow-800 px-1.5 py-0.5 rounded uppercase font-bold tracking-wider">Diff</span>}
+                                    </td>
+                                    <td className="p-3 text-red-700 border-r border-gray-100 max-w-[200px] overflow-hidden text-ellipsis" title={String(wizardExistingFlat[key] ?? '-')}>
+                                      {String(wizardExistingFlat[key] ?? '-')}
+                                    </td>
+                                    <td className="p-3 text-emerald-700 border-r border-gray-100 max-w-[200px] overflow-hidden text-ellipsis" title={String(wizardImportedFlat[key] ?? '-')}>
+                                      {String(wizardImportedFlat[key] ?? '-')}
+                                    </td>
+                                    <td className="p-2 bg-blue-50/30">
+                                      <input 
+                                        type={inputType}
+                                        disabled={isId}
+                                        value={wizardDraftFlat[key] ?? ''}
+                                        onChange={(e) => handleWizardDraftChange(key, e.target.value, originalType)}
+                                        className={`w-full p-2 border rounded outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all ${isId ? 'bg-gray-100 cursor-not-allowed text-gray-500 border-transparent' : 'bg-white font-bold text-blue-800 border-blue-200 shadow-sm'}`}
+                                      />
+                                    </td>
+                                  </tr>
+                                );
+                             })}
+                           </tbody>
+                         </table>
+                      </div>
+      
+                      <div className="flex justify-end mt-2">
+                           <button onClick={() => handleWizardAction('use_draft')} className="px-8 py-3 bg-blue-600 text-white font-bold text-sm rounded-lg hover:bg-blue-700 transition-transform active:scale-95 shadow-md flex items-center gap-2">
+                               Save Custom Merge & Next <i className="fas fa-arrow-right"></i>
+                           </button>
+                      </div>
+                  </div>
+               </div>
+            </div>
+          )}
+
+          {/* --- ADD PRODUCT MODAL --- */}
+          {isModalOpen && (
+            <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4 print:hidden">
+              <div className="bg-white rounded-xl shadow-2xl w-full max-w-[1200px] max-h-[90vh] overflow-y-auto animate-in zoom-in-95">
+                <div className="flex justify-between items-center p-5 border-b border-gray-200 sticky top-0 bg-white z-10 shadow-sm">
+                  <h3 className="text-xl font-bold text-gray-900">Add New Product</h3>
+                  <button onClick={() => setIsModalOpen(false)} className="text-gray-400 hover:text-gray-700"><i className="fas fa-times text-[24px]"></i></button>
+                </div>
+                
+                <form onSubmit={handleAddProductSubmit} className="p-6 space-y-6 bg-gray-50">
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4 bg-white p-5 rounded-lg shadow-sm border border-gray-100">
+                    
+                    <div className="md:col-span-1 border-r border-gray-100 pr-4 flex flex-col items-center justify-center">
+                      <label className="block text-xs font-bold text-gray-700 mb-2 w-full text-left">Product Image</label>
+                      <div className="w-32 h-32 border-2 border-dashed border-gray-300 rounded-lg flex items-center justify-center bg-gray-50 relative overflow-hidden group">
+                        {newProduct.image ? (
+                          <img src={newProduct.image} alt="Preview" className="w-full h-full object-contain p-1" />
+                        ) : (
+                          <div className="text-center text-gray-400">
+                            <i className="fas fa-image text-[32px] mx-auto mb-1 opacity-50"></i>
+                            <span className="text-[10px] block mt-1">Upload</span>
+                          </div>
+                        )}
+                        <input 
+                          type="file" 
+                          accept="image/*"
+                          onChange={handleImageUpload}
+                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                        />
+                        <div className="absolute inset-0 bg-black/40 hidden group-hover:flex items-center justify-center pointer-events-none">
+                          <i className="fas fa-upload text-white text-[20px]"></i>
+                        </div>
+                      </div>
+                      <p className="text-[9px] text-gray-400 mt-2 text-center">Click to upload image file.</p>
+                    </div>
+
+                    <div className="md:col-span-3 grid grid-cols-1 md:grid-cols-2 gap-4 pl-0 md:pl-2">
+                      <div className="md:col-span-2">
+                        <label className="block text-xs font-bold text-gray-700 mb-1">Product Name</label>
+                        <input required type="text" value={newProduct.name} onChange={e => setNewProduct({...newProduct, name: e.target.value})} className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-500 outline-none" />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-gray-700 mb-1">Product Category</label>
+                        <select required value={newProduct.productCategoryId} onChange={e => setNewProduct({...newProduct, productCategoryId: e.target.value})} className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-500 outline-none bg-white">
+                          <option value="" disabled>Select a category...</option>
+                          {productCategories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-gray-700 mb-1">Discount Category</label>
+                        <select required value={newProduct.categoryId} onChange={e => setNewProduct({...newProduct, categoryId: e.target.value})} className="w-full p-2 text-sm border rounded focus:ring-2 focus:ring-blue-500 outline-none bg-white">
+                          <option value="" disabled>Select a discount group...</option>
+                          {categories.map(c => <option key={c.id} value={c.id}>{c.name} ({c.discount}%)</option>)}
+                        </select>
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs font-bold text-gray-700 mb-1">Pack Qty & Unit</label>
+                        <div className="flex gap-2">
+                          <input type="number" min="0" step="any" placeholder="Qty" value={newProduct.packQty} onChange={e => setNewProduct({...newProduct, packQty: e.target.value})} className="w-1/2 p-2 text-sm border rounded focus:ring-2 focus:ring-blue-500 outline-none" />
+                          <input type="text" placeholder="Unit" value={newProduct.unit} onChange={e => setNewProduct({...newProduct, unit: e.target.value})} className="w-1/2 p-2 text-sm border rounded focus:ring-2 focus:ring-blue-500 outline-none" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    {['v1', 'v2', 'v3', 'v4'].map((v) => (
+                      <div key={v} className="bg-white p-4 rounded-lg shadow-sm border border-gray-200">
+                        <h4 className="font-bold text-blue-900 border-b border-gray-100 pb-2 mb-3 text-sm text-center bg-blue-50 py-1 rounded">{headers[v]}</h4>
+                        <div className="space-y-2">
+                          <div>
+                            <label className="block text-[10px] font-bold text-blue-700 uppercase">Dealer (ครบลัง)</label>
+                            <input type="number" required={v==='v1'} value={newProduct[`${v}DealerBox`]} onChange={e => setNewProduct({...newProduct, [`${v}DealerBox`]: e.target.value})} className="w-full p-1 text-sm border rounded focus:ring-1 focus:ring-blue-500 outline-none mt-1" />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-bold text-blue-500 uppercase">Dealer (ไม่ครบลัง)</label>
+                            <input type="number" required={v==='v1'} value={newProduct[`${v}DealerUnbox`]} onChange={e => setNewProduct({...newProduct, [`${v}DealerUnbox`]: e.target.value})} className="w-full p-1 text-sm border rounded focus:ring-1 focus:ring-blue-500 outline-none mt-1" />
+                          </div>
+                          <div className="border-t border-gray-100 pt-1 mt-1">
+                            <label className="block text-[10px] font-bold text-emerald-600 uppercase">Selling Price (แนะนำขาย)</label>
+                            <input type="number" required={v==='v1'} value={newProduct[`${v}SellingPrice`]} onChange={e => setNewProduct({...newProduct, [`${v}SellingPrice`]: e.target.value})} className="w-full p-1 text-sm border rounded focus:ring-1 focus:ring-emerald-500 outline-none mt-1" />
+                          </div>
+                          <div className="border-t border-gray-100 pt-1 mt-1">
+                            <label className="block text-[10px] font-bold text-gray-500 uppercase">List Price (ราคาตั้ง)</label>
+                            <input type="number" required={v==='v1'} value={newProduct[`${v}Retail`]} onChange={e => setNewProduct({...newProduct, [`${v}Retail`]: e.target.value})} className="w-full p-1 text-sm border rounded focus:ring-1 focus:ring-blue-500 outline-none mt-1" />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex justify-end gap-3 pt-4">
+                    <button type="button" onClick={() => setIsModalOpen(false)} className="px-5 py-2 text-sm text-gray-600 hover:bg-gray-200 rounded-lg font-bold transition-colors">Cancel</button>
+                    <button type="submit" className="px-6 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold shadow-md transition-transform active:scale-95">Save Product</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* --- CONFIRM DELETE MODAL --- */}
+          {productToDelete && (
+            <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 print:hidden">
+              <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 text-center animate-in zoom-in-95 duration-200">
+                <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <i className="fas fa-exclamation-triangle text-red-500 text-[32px]"></i>
+                </div>
+                <h3 className="text-lg font-bold text-gray-900 mb-2">Delete Product?</h3>
+                <p className="text-sm text-gray-600 mb-6 px-2">
+                  Are you sure you want to remove <strong>"{products.find(p => p.id === productToDelete)?.name}"</strong>? This action cannot be undone unless you have unsaved data to reload.
+                </p>
+                <div className="flex justify-center gap-3">
+                  <button onClick={() => setProductToDelete(null)} className="flex-1 py-2.5 bg-gray-100 text-gray-700 rounded-lg font-bold hover:bg-gray-200 transition-colors">Cancel</button>
+                  <button onClick={executeDeleteProduct} className="flex-1 py-2.5 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700 transition-colors shadow-sm">Yes, Delete</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
